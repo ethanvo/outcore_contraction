@@ -53,17 +53,19 @@ void LruCache::Put(const std::string &key, std::vector<float> data) {
   } else {
     entries_.emplace(key, CacheEntry{key, std::move(data)});
     lru_.push_front(key);
+    lru_lookup_[key] = lru_.begin();
     current_bytes_ += bytes;
   }
   EvictIfNeeded();
 }
 
 void LruCache::Touch(const std::string &key) {
-  auto it = std::find(lru_.begin(), lru_.end(), key);
-  if (it != lru_.end()) {
-    lru_.erase(it);
+  auto it = lru_lookup_.find(key);
+  if (it != lru_lookup_.end()) {
+    lru_.erase(it->second);
   }
   lru_.push_front(key);
+  lru_lookup_[key] = lru_.begin();
 }
 
 std::size_t LruCache::CurrentBytes() const {
@@ -75,6 +77,7 @@ void LruCache::EvictIfNeeded() {
   while (current_bytes_ > max_bytes_ && !lru_.empty()) {
     auto key = lru_.back();
     lru_.pop_back();
+    lru_lookup_.erase(key);
     auto it = entries_.find(key);
     if (it != entries_.end()) {
       current_bytes_ -= it->second.data.size() * sizeof(float);
@@ -101,11 +104,17 @@ const std::vector<float> &DoubleBuffer::ReadBuffer() const {
 
 void DoubleBuffer::Swap() { write_index_ = 1 - write_index_; }
 
-IOThread::IOThread(FetchCallback fetch_cb) : fetch_cb_(std::move(fetch_cb)) {
-  worker_ = std::thread(&IOThread::WorkerLoop, this);
-}
+IOThread::IOThread(FetchCallback fetch_cb) : fetch_cb_(std::move(fetch_cb)) {}
 
 IOThread::~IOThread() { Stop(); }
+
+void IOThread::Start() {
+  bool expected = false;
+  stop_.compare_exchange_strong(expected, false);
+  if (!worker_.joinable()) {
+    worker_ = std::thread(&IOThread::WorkerLoop, this);
+  }
+}
 
 void IOThread::Enqueue(const PrefetchRequest &request) {
   {
@@ -118,6 +127,16 @@ void IOThread::Enqueue(const PrefetchRequest &request) {
 std::optional<CacheEntry> IOThread::PopReady() {
   std::lock_guard<std::mutex> lock(mutex_);
   if (ready_.empty()) {
+    return std::nullopt;
+  }
+  CacheEntry entry = std::move(ready_.front());
+  ready_.pop_front();
+  return entry;
+}
+
+std::optional<CacheEntry> IOThread::WaitReady(std::chrono::milliseconds timeout) {
+  std::unique_lock<std::mutex> lock(mutex_);
+  if (!ready_cv_.wait_for(lock, timeout, [this] { return !ready_.empty(); })) {
     return std::nullopt;
   }
   CacheEntry entry = std::move(ready_.front());
@@ -158,6 +177,7 @@ void IOThread::WorkerLoop() {
       std::lock_guard<std::mutex> lock(mutex_);
       ready_.push_back(CacheEntry{request.key, std::move(data)});
     }
+    ready_cv_.notify_one();
   }
 }
 
@@ -166,11 +186,16 @@ OutcoreEngine::OutcoreEngine(std::size_t cache_bytes)
       double_buffer_(cache_bytes / 2),
       io_thread_([](const PrefetchRequest &request) {
         std::size_t elements = 1;
-        for (auto dim : request.descriptor.tile_shape) {
+        const auto &shape = request.descriptor.chunk_shape.empty()
+                                ? request.descriptor.tile_shape
+                                : request.descriptor.chunk_shape;
+        for (auto dim : shape) {
           elements *= dim;
         }
         return std::vector<float>(elements, 0.0f);
-      }) {}
+      }) {
+  io_thread_.Start();
+}
 
 void OutcoreEngine::RegisterBlock(const std::string &key, BlockMetadata metadata) {
   metadata_.Register(key, std::move(metadata));
@@ -187,6 +212,25 @@ void OutcoreEngine::QueuePrefetch(const std::string &key) {
 bool OutcoreEngine::TryConsume() {
   if (auto ready = io_thread_.PopReady()) {
     cache_.Put(ready->key, std::move(ready->data));
+    auto &write_buffer = double_buffer_.WriteBuffer();
+    const auto &cached = cache_.Get(ready->key);
+    if (cached && write_buffer.size() == cached->data.size()) {
+      std::copy(cached->data.begin(), cached->data.end(), write_buffer.begin());
+    }
+    double_buffer_.Swap();
+    return true;
+  }
+  return false;
+}
+
+bool OutcoreEngine::WaitConsume(std::chrono::milliseconds timeout) {
+  if (auto ready = io_thread_.WaitReady(timeout)) {
+    cache_.Put(ready->key, std::move(ready->data));
+    auto &write_buffer = double_buffer_.WriteBuffer();
+    const auto &cached = cache_.Get(ready->key);
+    if (cached && write_buffer.size() == cached->data.size()) {
+      std::copy(cached->data.begin(), cached->data.end(), write_buffer.begin());
+    }
     double_buffer_.Swap();
     return true;
   }
@@ -194,6 +238,10 @@ bool OutcoreEngine::TryConsume() {
 }
 
 std::size_t OutcoreEngine::CacheBytes() const { return cache_.CurrentBytes(); }
+
+std::optional<CacheEntry> OutcoreEngine::LookupCache(const std::string &key) {
+  return cache_.Get(key);
+}
 
 BlockDescriptor OutcoreEngine::AlignChunkToTile(const std::vector<std::size_t> &tile_shape,
                                                const std::vector<std::size_t> &chunk_alignment,
@@ -210,7 +258,7 @@ BlockDescriptor OutcoreEngine::AlignChunkToTile(const std::vector<std::size_t> &
     std::size_t align = chunk_alignment[i] ? chunk_alignment[i] : 1;
     std::size_t aligned = ((tile + align - 1) / align) * align;
     descriptor.chunk_shape[i] = aligned;
-    elements *= tile;
+    elements *= aligned;
   }
   descriptor.bytes = elements * element_bytes;
   return descriptor;

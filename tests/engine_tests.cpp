@@ -1,9 +1,6 @@
 #include "outcore/engine.hpp"
 
 #include <cassert>
-#include <chrono>
-#include <thread>
-
 int main() {
   using namespace outcore;
 
@@ -13,16 +10,12 @@ int main() {
   engine.RegisterBlock("block0", metadata);
   engine.QueuePrefetch("block0");
 
-  bool consumed = false;
-  for (int i = 0; i < 50; ++i) {
-    if (engine.TryConsume()) {
-      consumed = true;
-      break;
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-  }
-
+  bool consumed = engine.WaitConsume(std::chrono::milliseconds(250));
   assert(consumed && "Expected IO thread to provide data");
+  auto cached = engine.LookupCache("block0");
+  assert(cached.has_value());
+  std::size_t expected_elements = descriptor.chunk_shape[0] * descriptor.chunk_shape[1];
+  assert(cached->data.size() == expected_elements);
   assert(engine.CacheBytes() > 0 && "Cache should have data after consume");
 
   BlockDescriptor aligned = OutcoreEngine::AlignChunkToTile({7, 3}, {4, 2}, sizeof(float));

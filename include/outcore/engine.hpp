@@ -1,9 +1,11 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <deque>
+#include <list>
 #include <functional>
 #include <mutex>
 #include <optional>
@@ -48,15 +50,16 @@ class LruCache {
   explicit LruCache(std::size_t max_bytes);
   std::optional<CacheEntry> Get(const std::string &key);
   void Put(const std::string &key, std::vector<float> data);
-  void Touch(const std::string &key);
   std::size_t CurrentBytes() const;
 
  private:
   void EvictIfNeeded();
+  void Touch(const std::string &key);
 
   std::size_t max_bytes_;
   std::size_t current_bytes_ = 0;
-  std::deque<std::string> lru_;
+  std::list<std::string> lru_;
+  std::unordered_map<std::string, std::list<std::string>::iterator> lru_lookup_;
   std::unordered_map<std::string, CacheEntry> entries_;
   mutable std::mutex mutex_;
 };
@@ -85,9 +88,11 @@ class IOThread {
 
   explicit IOThread(FetchCallback fetch_cb);
   ~IOThread();
+  void Start();
 
   void Enqueue(const PrefetchRequest &request);
   std::optional<CacheEntry> PopReady();
+  std::optional<CacheEntry> WaitReady(std::chrono::milliseconds timeout);
   void Stop();
   std::size_t Pending() const;
 
@@ -97,6 +102,7 @@ class IOThread {
   FetchCallback fetch_cb_;
   mutable std::mutex mutex_;
   std::condition_variable cv_;
+  std::condition_variable ready_cv_;
   std::deque<PrefetchRequest> queue_;
   std::deque<CacheEntry> ready_;
   std::thread worker_;
@@ -110,7 +116,9 @@ class OutcoreEngine {
   void RegisterBlock(const std::string &key, BlockMetadata metadata);
   void QueuePrefetch(const std::string &key);
   bool TryConsume();
+  bool WaitConsume(std::chrono::milliseconds timeout);
   std::size_t CacheBytes() const;
+  std::optional<CacheEntry> LookupCache(const std::string &key);
 
   static BlockDescriptor AlignChunkToTile(const std::vector<std::size_t> &tile_shape,
                                          const std::vector<std::size_t> &chunk_alignment,
