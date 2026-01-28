@@ -129,6 +129,7 @@ class OutcoreEngine {
   LruCache cache_;
   DoubleBuffer double_buffer_;
   IOThread io_thread_;
+  mutable std::mutex buffer_mutex_;
 };
 
 }  // namespace outcore

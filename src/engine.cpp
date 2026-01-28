@@ -1,6 +1,7 @@
 #include "outcore/engine.hpp"
 
 #include <algorithm>
+#include <limits>
 #include <stdexcept>
 
 namespace outcore {
@@ -211,12 +212,13 @@ void OutcoreEngine::QueuePrefetch(const std::string &key) {
 
 bool OutcoreEngine::TryConsume() {
   if (auto ready = io_thread_.PopReady()) {
-    cache_.Put(ready->key, std::move(ready->data));
-    auto &write_buffer = double_buffer_.WriteBuffer();
-    const auto &cached = cache_.Get(ready->key);
-    if (cached && write_buffer.size() == cached->data.size()) {
-      std::copy(cached->data.begin(), cached->data.end(), write_buffer.begin());
+    std::lock_guard<std::mutex> lock(buffer_mutex_);
+    if (double_buffer_.WriteBuffer().size() != ready->data.size()) {
+      double_buffer_.Resize(ready->data.size() * sizeof(float));
     }
+    auto &write_buffer = double_buffer_.WriteBuffer();
+    std::copy(ready->data.begin(), ready->data.end(), write_buffer.begin());
+    cache_.Put(ready->key, std::move(ready->data));
     double_buffer_.Swap();
     return true;
   }
@@ -225,12 +227,13 @@ bool OutcoreEngine::TryConsume() {
 
 bool OutcoreEngine::WaitConsume(std::chrono::milliseconds timeout) {
   if (auto ready = io_thread_.WaitReady(timeout)) {
-    cache_.Put(ready->key, std::move(ready->data));
-    auto &write_buffer = double_buffer_.WriteBuffer();
-    const auto &cached = cache_.Get(ready->key);
-    if (cached && write_buffer.size() == cached->data.size()) {
-      std::copy(cached->data.begin(), cached->data.end(), write_buffer.begin());
+    std::lock_guard<std::mutex> lock(buffer_mutex_);
+    if (double_buffer_.WriteBuffer().size() != ready->data.size()) {
+      double_buffer_.Resize(ready->data.size() * sizeof(float));
     }
+    auto &write_buffer = double_buffer_.WriteBuffer();
+    std::copy(ready->data.begin(), ready->data.end(), write_buffer.begin());
+    cache_.Put(ready->key, std::move(ready->data));
     double_buffer_.Swap();
     return true;
   }
@@ -246,6 +249,9 @@ std::optional<CacheEntry> OutcoreEngine::LookupCache(const std::string &key) {
 BlockDescriptor OutcoreEngine::AlignChunkToTile(const std::vector<std::size_t> &tile_shape,
                                                const std::vector<std::size_t> &chunk_alignment,
                                                std::size_t element_bytes) {
+  if (tile_shape.empty() || chunk_alignment.empty()) {
+    throw std::invalid_argument("tile shape and alignment must be non-empty");
+  }
   if (tile_shape.size() != chunk_alignment.size()) {
     throw std::invalid_argument("tile shape and alignment rank must match");
   }
@@ -256,8 +262,14 @@ BlockDescriptor OutcoreEngine::AlignChunkToTile(const std::vector<std::size_t> &
   for (std::size_t i = 0; i < tile_shape.size(); ++i) {
     std::size_t tile = tile_shape[i];
     std::size_t align = chunk_alignment[i] ? chunk_alignment[i] : 1;
+    if (tile > std::numeric_limits<std::size_t>::max() - (align - 1)) {
+      throw std::overflow_error("tile alignment overflow");
+    }
     std::size_t aligned = ((tile + align - 1) / align) * align;
     descriptor.chunk_shape[i] = aligned;
+    if (elements > std::numeric_limits<std::size_t>::max() / aligned) {
+      throw std::overflow_error("chunk element count overflow");
+    }
     elements *= aligned;
   }
   descriptor.bytes = elements * element_bytes;
