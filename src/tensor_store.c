@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
+#include "tensor_store.h"
 
 /* * Helper: Calculate chunk dimensions based on target cache size.
  * target_bytes: Desired size of one chunk in bytes (e.g., 2MB).
@@ -36,6 +37,7 @@ void calculate_chunk_dims(size_t target_bytes, int rank, const hsize_t *global_d
  * Create an HDF5 file and a chunked dataset optimized for TBLIS.
  */
 void create_chunked_dataset(const char *filename, const char *dataset_name, int rank, const hsize_t *global_dims) {
+  // This is a simplified version that doesn't use MPI for now
   hid_t file_id, space_id, dset_id, dcpl_id;
   herr_t status;
   hsize_t chunk_dims[rank];
@@ -53,19 +55,17 @@ void create_chunked_dataset(const char *filename, const char *dataset_name, int 
   // 3. Setup Property List for Chunking
   dcpl_id = H5Pcreate(H5P_DATASET_CREATE);
 
-  // Caculate optimal chunk size (Target: 2MB = 2 * 1024 * 1024 bytes)
+  // Calculate optimal chunk size (Target: 2MB = 2 * 1024 * 1024 bytes)
   calculate_chunk_dims(2 * 1024 * 1024, rank, global_dims, chunk_dims);
 
   // Apply chunking parameters
   status = H5Pset_chunk(dcpl_id, rank, chunk_dims);
 
   // 4. Set Fill Value (Optimization for Sparsity)
-  // If we never write to a chunk, it takes 0 disk space.
   double fill_value = 0.0;
   status = H5Pset_fill_value(dcpl_id, H5T_NATIVE_DOUBLE, &fill_value);
 
-  // Optional: Set allocation time to "Incremental" (allocate only when written)
-  // This is often default for chunked datasets, but explicit is safer.
+  // Optional: Set allocation time to "Incremental" 
   status = H5Pset_alloc_time(dcpl_id, H5D_ALLOC_TIME_INCR);
 
   // 5. Create the Dataset
@@ -87,16 +87,4 @@ void create_chunked_dataset(const char *filename, const char *dataset_name, int 
   H5Dclose(dset_id);
   H5Sclose(space_id);
   H5Fclose(file_id);
-}
-
-int main() {
-  // Example: Create a 3D Tensor of size 1000 x 1000 x 1000
-  hsize_t dims[3] = {1000, 1000, 1000};
-  create_chunked_dataset("tensor_store.h5", "TensorA", 3, dims);
-
-  // Example: Create a "Flat" Tensor where global dim is smaller than ideal chunk
-  hsize_t dims_flat[3] = {10, 5000, 5000};
-  create_chunked_dataset("tensor_store.h5", "TensorB", 3, dims_flat);
-
-  return 0;
 }
