@@ -1,7 +1,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
-#include "include/tensor_store.h"
+#include <hdf5.h>
+#include "tensor_store.h"
 
 int main() {
     printf("Testing tensor_store.c functions...\n");
