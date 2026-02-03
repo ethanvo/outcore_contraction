@@ -1,0 +1,3 @@
+-I/Users/ethanvo/builds/spack/develop/spack/var/spack/environments/global/.spack-env/view/include
+-I../include
+-Wall

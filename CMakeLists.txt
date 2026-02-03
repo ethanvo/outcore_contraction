@@ -6,20 +6,10 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-add_library(outcore_contraction
-  src/engine.cpp
-  src/tensor_store.c
- )
-
-target_include_directories(outcore_contraction PUBLIC
-  ${CMAKE_CURRENT_SOURCE_DIR}/include
- )
-
 # Try to find MPI
 find_package(MPI QUIET)
 if(MPI_FOUND)
-  target_link_libraries(outcore_contraction PUBLIC MPI::MPI_C)
-  target_compile_definitions(outcore_contraction PUBLIC HAVE_MPI)
+  message(STATUS "MPI found")
 endif()
 
 # Try to find parallel HDF5
@@ -32,7 +22,31 @@ if(HDF5_FOUND)
     message(STATUS "Using serial HDF5")
   endif()
 else()
-  message(WARNING "HDF5 not found, building without HDF5 support")
+  message(STATUS "HDF5 not found, building without HDF5 support")
+endif()
+
+# Create library with core files
+add_library(outcore_contraction
+  src/engine.cpp
+ )
+
+# Set include directories
+target_include_directories(outcore_contraction PUBLIC
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+ )
+
+# Add tensor_store.c to library only if HDF5 is found
+if(HDF5_FOUND)
+  target_sources(outcore_contraction PRIVATE src/tensor_store.c)
+  target_link_libraries(outcore_contraction PUBLIC ${HDF5_LIBRARIES})
+  target_include_directories(outcore_contraction PUBLIC ${HDF5_INCLUDE_DIRS})
+  target_compile_definitions(outcore_contraction PUBLIC HAVE_HDF5)
+endif()
+
+# Link MPI if it was found
+if(MPI_FOUND)
+  target_link_libraries(outcore_contraction PUBLIC MPI::MPI_C)
+  target_compile_definitions(outcore_contraction PUBLIC HAVE_MPI)
 endif()
 
 add_executable(outcore_tests
