@@ -1,0 +1,188 @@
+This is a comprehensive **Software Development Plan (SDP)** for your Out-of-Core Tensor Contraction Engine.
+
+This plan assumes a hybrid C/C++ approach: **C** for the low-level HDF5 storage layer (to match the API) and **C++** for the high-level logic (registry, memory pooling, and threading).
+
+---
+
+### **1. Repository & Branching Strategy**
+
+**Repository Structure:**
+
+```text
+/root
+  /src
+    /storage      (HDF5 primitives, C code)
+    /core         (Registry, Scheduler, C++ logic)
+    /compute      (TBLIS wrappers)
+  /include        (Public headers)
+  /tests          (Unit tests for each module)
+  /benchmarks     (Large scale I/O and compute tests)
+  CMakeLists.txt
+
+```
+
+**Branching Workflow (Git Flow):**
+
+* `main`: Stable, production-ready code.
+* `develop`: The integration branch for daily work.
+* **Feature Branches:**
+* `feat/storage-primitives` (Current focus)
+* `feat/metadata-registry`
+* `feat/memory-pool`
+* `feat/contraction-scheduler`
+* `feat/async-threading`
+
+
+
+---
+
+### **2. Development Phases**
+
+We will break the project into 6 distinct phases. You have essentially started **Phase 1**.
+
+#### **Phase 1: The Storage Layer (HDF5 primitives)**
+
+**Goal:** Abstract away the complexity of HDF5 hyperslabs and types.
+
+* **Step 1.1:** Tensor Creation & Chunking. **(COMPLETED)**
+* **Step 1.2:** The Tile Reader/Writer.
+* *Task:* Implement `read_tile(file_id, coords, buffer)` and `write_tile`.
+* *Critical Detail:* Must handle HDF5 hyperslab selection logic.
+
+
+* **Step 1.3:** Unit Testing.
+* *Task:* Verify data written to a specific chunk can be read back correctly without corrupting neighbors.
+
+
+
+#### **Phase 2: The Metadata Layer (The "Brain")**
+
+**Goal:** Track the shape, location, and existence of tiles in RAM without querying the disk.
+
+* **Step 2.1:** The `TensorGrid` Class.
+* *Task:* Calculate how many tiles exist along each dimension based on global shape and chunk size.
+
+
+* **Step 2.2:** The Block-Sparse Map.
+* *Task:* A `std::map` or hash table that tracks which tiles actually contain data. If a tile is all-zeros, it shouldn't exist in the map.
+
+
+* **Step 2.3:** Intersection Logic.
+* *Task:* Given an operation , determine exactly which tiles of  and  are needed to compute a specific tile of .
+
+
+
+#### **Phase 3: Memory Management (The "Heart")**
+
+**Goal:** Prevent RAM overflows.
+
+* **Step 3.1:** The Buffer Pool.
+* *Task:* Pre-allocate a large block of RAM (e.g., 4GB). Slice it into "Pages" that match the Tile size.
+
+
+* **Step 3.2:** The Handle System.
+* *Task:* `acquire_page()` returns a pointer; `release_page()` marks it as free.
+
+
+* **Step 3.3:** LRU Cache (Optional for v1, critical for v2).
+* *Task:* If Tile A(0,0) is needed for multiple C tiles, keep it in the pool; don't re-read from disk.
+
+
+
+#### **Phase 4: The Compute Core (Single-Threaded)**
+
+**Goal:** Correctness. Connect Storage  Memory  TBLIS.
+
+* **Step 4.1:** The TBLIS Adapter.
+* *Task:* Wrap `tblis_tensor_mult` to accept your raw pointers.
+
+
+* **Step 4.2:** The Sequential Loop (SUMMA).
+* *Task:* Implement the nested loops:
+```text
+For each Tile_C:
+   Load Tile_C (or init to 0)
+   For each k (contraction dim):
+      Load Tile_A, Tile_B
+      TBLIS(Tile_A, Tile_B, Tile_C)
+      Release Tile_A, Tile_B
+   Write Tile_C
+
+```
+
+
+
+
+
+#### **Phase 5: Performance (The "Turbo")**
+
+**Goal:** Hiding Latency.
+
+* **Step 5.1:** Thread Separation.
+* *Task:* Create 1 "Disk Thread" and N "Compute Threads".
+
+
+* **Step 5.2:** Double Buffering / Prefetching.
+* *Task:* While the compute thread calculates , the disk thread reads .
+
+
+* **Step 5.3:** Tuning.
+* *Task:* Adjust Chunk sizes and Buffer Pool sizes to find the saturation point.
+
+
+
+---
+
+### **3. Component Architecture Diagram**
+
+1. **Registry:** Holds the "Map" of the universe.
+2. **Scheduler:** Decides *which* tiles to process next.
+3. **Buffer Pool:** Holds the actual `double*` data.
+4. **IO Thread:** Moves data between HDF5 and Buffer Pool.
+5. **Compute Thread:** Moves data between Buffer Pool and TBLIS.
+
+---
+
+### **4. Detailed Feature Specifications**
+
+#### **Component A: `tensor_io.c` (C Module)**
+
+* **Features:**
+* `create_tensor(...)`: Your existing code.
+* `read_chunk(offset_coords, data_ptr)`: Reads exactly one chunk.
+* `write_chunk(offset_coords, data_ptr)`: Writes exactly one chunk.
+
+
+* **Why C?** HDF5's C API is cleaner for precise hyperslab control.
+
+#### **Component B: `TileRegistry` (C++ Class)**
+
+* **Features:**
+* `get_tile_status(i, j, k)`: Returns `EXISTS`, `ZERO`, or `IN_MEMORY`.
+* `get_tile_id(i, j, k)`: Returns a unique integer ID for hashing.
+
+
+
+#### **Component C: `ExecutionEngine` (C++ Class)**
+
+* **Features:**
+* **The Plan:** Generates a list of "Tasks" (e.g., "Contract A(0,1) with B(1,2) into C(0,2)").
+* **The Queue:** A thread-safe queue of tasks waiting for data.
+
+
+
+---
+
+### **5. Immediate Next Steps (The "Checklist")**
+
+You have completed **Phase 1, Step 1.1**.
+
+**To move to Step 1.2 (The Reader/Writer), you need to answer:**
+
+1. How do we select a specific chunk using HDF5 hyperslabs?
+2. How do we pass data pointers between your C storage layer and C++ logic?
+
+**Recommendation:**
+We should stay in **C** for one more step to implement `read_chunk` and `write_chunk`. These are the "shovels" used by the rest of the engine.
+
+Would you like to implement the `read_chunk` function next?
