@@ -66,4 +66,15 @@ if(HDF5_FOUND)
     target_link_libraries(test_tensor_store ${MPI_LIBRARIES})
     target_compile_definitions(test_tensor_store PUBLIC HAVE_MPI)
   endif()
+  
+  # Add comprehensive I/O test
+  add_executable(test_io test_io.c)
+  target_link_libraries(test_io ${HDF5_LIBRARIES} m outcore_contraction)
+  target_include_directories(test_io PUBLIC ${HDF5_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  
+  # If MPI is available, link with MPI
+  if(MPI_FOUND)
+    target_link_libraries(test_io ${MPI_LIBRARIES})
+    target_compile_definitions(test_io PUBLIC HAVE_MPI)
+  endif()
 endif()
