@@ -28,6 +28,7 @@ endif()
 # Create library with core files
 add_library(outcore_contraction
   src/engine.cpp
+  src/registry.c
  )
 
 # Set include directories

@@ -1,3 +1,4 @@
+#include "registry.h"
 #include "tensor_store.h" // Ensure this includes create_chunked_dataset
 #include <hdf5.h>
 #include <stdio.h>
@@ -97,6 +98,44 @@ int main() {
       printf("    Verification Successful.\n");
     }
   }
+
+  // ... previous code that wrote chunks ...
+
+  printf("\n--- Testing Registry Scanning ---\n");
+
+  // 1. Initialize Registry (In memory)
+  // Use the same dimensions you used to create the file (300^3)
+  // Use the same target size (2MB)
+  TensorRegistry *reg = registry_create(rank, global_dims, 2 * 1024 * 1024);
+
+  // 2. Verify Initial State (Should be empty)
+  TileMetadata *t_check = registry_get_tile(reg, 0, 0, 0);
+  if (t_check->status == TILE_STATUS_NULL) {
+    printf("Registry initially empty (Correct).\n");
+  }
+
+  // 3. Scan the File
+  long found = registry_scan_file(dset_id, reg);
+
+  // 4. Verification
+  if (found == 3) {
+    printf("SUCCESS: Registry correctly identified 3 chunks on disk.\n");
+  } else {
+    printf("FAILURE: Registry found %ld chunks, expected 3.\n", found);
+  }
+
+  // 5. Check specific tile status
+  t_check = registry_get_tile(reg, 1, 1, 1); // We wrote this one earlier
+  if (t_check && t_check->status == TILE_STATUS_ON_DISK) {
+    printf("Tile (1,1,1) is marked ON_DISK (Correct).\n");
+  }
+
+  t_check = registry_get_tile(reg, 0, 1, 0); // We NEVER wrote this one
+  if (t_check && t_check->status == TILE_STATUS_NULL) {
+    printf("Tile (0,1,0) is marked NULL (Correct).\n");
+  }
+
+  registry_destroy(reg);
 
   free(write_data);
   free(read_data);
