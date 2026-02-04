@@ -29,6 +29,7 @@ endif()
 add_library(outcore_contraction
   src/engine.cpp
   src/registry.c
+  src/memory.c
  )
 
 # Set include directories
@@ -56,6 +57,11 @@ add_executable(outcore_tests
 
 target_link_libraries(outcore_tests PRIVATE outcore_contraction)
 
+# Add executable for memory tests
+add_executable(test_memory tests/test_memory.c)
+target_link_libraries(test_memory PRIVATE outcore_contraction)
+target_include_directories(test_memory PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
 # Add a test for tensor_store functions instead of executable
 if(HDF5_FOUND)
   add_executable(test_tensor_store tests/test_tensor_store.c)
@@ -69,7 +75,7 @@ if(HDF5_FOUND)
   endif()
   
   # Add comprehensive I/O test
-  add_executable(test_io test_io.c)
+  add_executable(test_io tests/test_io.c)
   target_link_libraries(test_io ${HDF5_LIBRARIES} m outcore_contraction)
   target_include_directories(test_io PUBLIC ${HDF5_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/include)
   
