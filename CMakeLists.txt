@@ -1,87 +1,58 @@
-cmake_minimum_required(VERSION 3.16)
-project(outcore_contraction LANGUAGES C CXX)
+cmake_minimum_required(VERSION 3.12)
+project(OOC_Tensor_Engine VERSION 1.0 LANGUAGES C)
 
-set(CMAKE_C_STANDARD 11)
+# --- 1. Compiler Settings ---
+set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON) # Useful for VSCode/Clangd intellisense
 
-# Try to find MPI
-find_package(MPI QUIET)
-if(MPI_FOUND)
-  message(STATUS "MPI found")
+# --- 2. Dependencies ---
+# We find HDF5 (C Component) and the Math library
+find_package(HDF5 REQUIRED COMPONENTS C)
+
+# --- 3. The Core Library (The "Engine") ---
+# We compile the components into a static library to avoid repeating them
+add_library(tensor_core STATIC
+    src/tensor_store.c
+    src/registry.c
+    src/memory.c
+)
+
+# Allow the library to find headers in the current root directory
+target_include_directories(tensor_core PUBLIC include)
+
+# Link HDF5 and Math (-lm) to the core
+target_link_libraries(tensor_core PRIVATE ${HDF5_C_LIBRARIES} m)
+target_include_directories(tensor_core PRIVATE ${HDF5_INCLUDE_DIRS})
+
+# --- 5. Test Drivers ---
+# This matches the test_io.c you uploaded
+if(EXISTS tests/test_io.c)
+    add_executable(test_io tests/test_io.c)
+    target_link_libraries(test_io PRIVATE tensor_core)
+    target_link_libraries(test_io PRIVATE ${HDF5_C_LIBRARIES} m)
+    target_include_directories(test_io PRIVATE ${HDF5_INCLUDE_DIRS})
 endif()
 
-# Try to find parallel HDF5
-find_package(HDF5 QUIET COMPONENTS C HL)
-if(HDF5_FOUND)
-  # Check if we can build with parallel HDF5 features
-  if(MPI_FOUND AND HDF5_IS_PARALLEL)
-    message(STATUS "Using parallel HDF5 with MPI support")
-  else()
-    message(STATUS "Using serial HDF5")
-  endif()
-else()
-  message(STATUS "HDF5 not found, building without HDF5 support")
+# (Optional) Tensor Store Test
+if(EXISTS tests/test_tensor_store.c)
+    add_executable(test_tensor_store tests/test_tensor_store.c)
+    target_link_libraries(test_tensor_store PRIVATE tensor_core)
+    target_link_libraries(test_tensor_store PRIVATE ${HDF5_C_LIBRARIES} m)
+    target_include_directories(test_tensor_store PRIVATE ${HDF5_INCLUDE_DIRS})
 endif()
 
-# Create library with core files
-add_library(outcore_contraction
-  src/engine.cpp
-  src/registry.c
-  src/memory.c
- )
+# --- 6. Output Config Info ---
+message(STATUS "Build Config:")
+message(STATUS "  HDF5 Found: ${HDF5_FOUND}")
+message(STATUS "  HDF5 Libs:  ${HDF5_C_LIBRARIES}")
 
-# Set include directories
-target_include_directories(outcore_contraction PUBLIC
-  ${CMAKE_CURRENT_SOURCE_DIR}/include
- )
+add_executable(gen_data src/gen_data.c)
+target_link_libraries(gen_data PRIVATE tensor_core)
+target_link_libraries(gen_data PRIVATE ${HDF5_C_LIBRARIES} m)
+target_include_directories(gen_data PRIVATE ${HDF5_INCLUDE_DIRS})
 
-# Add tensor_store.c to library only if HDF5 is found
-if(HDF5_FOUND)
-  target_sources(outcore_contraction PRIVATE src/tensor_store.c)
-  target_link_libraries(outcore_contraction PUBLIC ${HDF5_LIBRARIES})
-  target_include_directories(outcore_contraction PUBLIC ${HDF5_INCLUDE_DIRS})
-  target_compile_definitions(outcore_contraction PUBLIC HAVE_HDF5)
-endif()
-
-# Link MPI if it was found
-if(MPI_FOUND)
-  target_link_libraries(outcore_contraction PUBLIC MPI::MPI_C)
-  target_compile_definitions(outcore_contraction PUBLIC HAVE_MPI)
-endif()
-
-add_executable(outcore_tests
-  tests/engine_tests.cpp
- )
-
-target_link_libraries(outcore_tests PRIVATE outcore_contraction)
-
-# Add executable for memory tests
-add_executable(test_memory tests/test_memory.c)
-target_link_libraries(test_memory PRIVATE outcore_contraction)
-target_include_directories(test_memory PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-
-# Add a test for tensor_store functions instead of executable
-if(HDF5_FOUND)
-  add_executable(test_tensor_store tests/test_tensor_store.c)
-  target_link_libraries(test_tensor_store ${HDF5_LIBRARIES} m outcore_contraction)
-  target_include_directories(test_tensor_store PUBLIC ${HDF5_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/include)
-  
-  # If MPI is available, link with MPI
-  if(MPI_FOUND)
-    target_link_libraries(test_tensor_store ${MPI_LIBRARIES})
-    target_compile_definitions(test_tensor_store PUBLIC HAVE_MPI)
-  endif()
-  
-  # Add comprehensive I/O test
-  add_executable(test_io tests/test_io.c)
-  target_link_libraries(test_io ${HDF5_LIBRARIES} m outcore_contraction)
-  target_include_directories(test_io PUBLIC ${HDF5_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/include)
-  
-  # If MPI is available, link with MPI
-  if(MPI_FOUND)
-    target_link_libraries(test_io ${MPI_LIBRARIES})
-    target_compile_definitions(test_io PUBLIC HAVE_MPI)
-  endif()
-endif()
+add_executable(engine_app src/engine.c)
+target_link_libraries(engine_app PRIVATE tensor_core)
+target_link_libraries(engine_app PRIVATE ${HDF5_C_LIBRARIES} m)
+target_include_directories(engine_app PRIVATE ${HDF5_INCLUDE_DIRS})
