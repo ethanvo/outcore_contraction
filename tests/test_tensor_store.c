@@ -2,199 +2,324 @@
 #include <hdf5.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
-// Test function for get_physical_offset
-int test_get_physical_offset() {
-  printf("Testing get_physical_offset function...\n");
+static int test_get_physical_offset(void)
+{
+    printf("Testing get_physical_offset...\n");
 
-  hsize_t tile_coords[] = {0, 1, 2};
-  hsize_t chunk_dims[] = {10, 20, 30};
-  hsize_t phys_offset[3];
+    hsize_t tile_coords[] = {0, 1, 2};
+    hsize_t chunk_dims[]  = {10, 20, 30};
+    hsize_t phys_offset[3];
 
-  get_physical_offset(3, tile_coords, chunk_dims, phys_offset);
+    get_physical_offset(3, tile_coords, chunk_dims, phys_offset);
 
-  // Verify results
-  if (phys_offset[0] != 0 || phys_offset[1] != 20 || phys_offset[2] != 60) {
-    printf("ERROR: get_physical_offset produced incorrect results\n");
-    return 1;
-  }
-
-  printf("get_physical_offset test PASSED\n");
-  return 0;
-}
-
-// Test function for calculate_chunk_dims
-int test_calculate_chunk_dims() {
-  printf("Testing calculate_chunk_dims function...\n");
-
-  // Test with large dimensions
-  hsize_t global_dims[] = {1000, 1000, 1000};
-  hsize_t chunk_dims_test[3];
-
-  calculate_chunk_dims(2 * 1024 * 1024, 3, global_dims, chunk_dims_test);
-
-  // Verify that results are reasonable (should be around 64x64x64 for 2MB
-  // chunks)
-  if (chunk_dims_test[0] < 1 || chunk_dims_test[0] > 1000 ||
-      chunk_dims_test[1] < 1 || chunk_dims_test[1] > 1000 ||
-      chunk_dims_test[2] < 1 || chunk_dims_test[2] > 1000) {
-    printf("ERROR: calculate_chunk_dims produced invalid results\n");
-    return 1;
-  }
-
-  // Test with smaller dimensions
-  hsize_t small_dims[] = {100, 100, 100};
-  hsize_t small_chunk_dims[3];
-
-  calculate_chunk_dims(2 * 1024 * 1024, 3, small_dims, small_chunk_dims);
-
-  if (small_chunk_dims[0] < 1 || small_chunk_dims[0] > 100 ||
-      small_chunk_dims[1] < 1 || small_chunk_dims[1] > 100 ||
-      small_chunk_dims[2] < 1 || small_chunk_dims[2] > 100) {
-    printf("ERROR: calculate_chunk_dims with small dims produced invalid "
-           "results\n");
-    return 1;
-  }
-
-  printf("calculate_chunk_dims test PASSED\n");
-  return 0;
-}
-
-// Test function for create_chunked_dataset
-int test_create_chunked_dataset() {
-  printf("Testing create_chunked_dataset function...\n");
-
-  // Create a temporary file name for testing
-  const char *filename = "test_tensor.h5";
-  const char *dataset_name = "test_tensor";
-
-  hsize_t test_dims[] = {100, 100};
-
-  // This function should execute without crashing
-  create_chunked_dataset(filename, dataset_name, 2, test_dims);
-
-  // Try to open the file to verify it was created successfully
-  hid_t file_id = H5Fopen(filename, H5F_ACC_RDONLY, H5P_DEFAULT);
-  if (file_id < 0) {
-    printf("ERROR: Could not open created dataset file\n");
-    return 1;
-  }
-
-  // Try to open the dataset
-  hid_t dset_id = H5Dopen2(file_id, dataset_name, H5P_DEFAULT);
-  if (dset_id < 0) {
-    printf("ERROR: Could not open created dataset\n");
-    H5Fclose(file_id);
-    return 1;
-  }
-
-  // Clean up
-  H5Dclose(dset_id);
-  H5Fclose(file_id);
-
-  // Remove the test file
-  remove(filename);
-
-  printf("create_chunked_dataset test PASSED\n");
-  return 0;
-}
-
-// Test function for read_chunk_fast and write_chunk_fast
-int test_read_write_chunk_fast() {
-  printf("Testing read_chunk_fast and write_chunk_fast functions...\n");
-
-  // Create a temporary file name for testing
-  const char *filename = "test_rw.h5";
-  const char *dataset_name = "test_rw_tensor";
-
-  hsize_t test_dims[] = {10, 10};
-  const int rank = 2;
-
-  // Create the dataset
-  create_chunked_dataset(filename, dataset_name, rank, test_dims);
-
-  // Open the file and dataset
-  hid_t file_id = H5Fopen(filename, H5F_ACC_RDWR, H5P_DEFAULT);
-  if (file_id < 0) {
-    printf("ERROR: Could not open dataset file\n");
-    return 1;
-  }
-
-  hid_t dset_id = H5Dopen2(file_id, dataset_name, H5P_DEFAULT);
-  if (dset_id < 0) {
-    printf("ERROR: Could not open dataset\n");
-    H5Fclose(file_id);
-    return 1;
-  }
-
-  // Test data
-  double write_data[100];
-  for (int i = 0; i < 100; i++) {
-    write_data[i] = (double)(i + 1);
-  }
-
-  hsize_t phys_offset[] = {0, 0};
-  hsize_t chunk_dims[] = {10, 10};
-
-  // Write data using write_chunk_fast
-  herr_t write_status =
-      write_chunk_fast(dset_id, phys_offset, write_data, rank, chunk_dims);
-  if (write_status < 0) {
-    printf("ERROR: write_chunk_fast failed\n");
-    H5Dclose(dset_id);
-    H5Fclose(file_id);
-    return 1;
-  }
-
-  // Read data back using read_chunk_fast
-  double read_data[100];
-  herr_t read_status =
-      read_chunk_fast(dset_id, phys_offset, read_data, rank, chunk_dims);
-  if (read_status < 0) {
-    printf("ERROR: read_chunk_fast failed\n");
-    H5Dclose(dset_id);
-    H5Fclose(file_id);
-    return 1;
-  }
-
-  // Verify data integrity
-  for (int i = 0; i < 100; i++) {
-    if (write_data[i] != read_data[i]) {
-      printf("ERROR: Data mismatch at index %d\n", i);
-      H5Dclose(dset_id);
-      H5Fclose(file_id);
-      return 1;
+    if (phys_offset[0] != 0 || phys_offset[1] != 20 || phys_offset[2] != 60) {
+        printf("  FAIL: expected (0,20,60) got (%llu,%llu,%llu)\n",
+               (unsigned long long)phys_offset[0],
+               (unsigned long long)phys_offset[1],
+               (unsigned long long)phys_offset[2]);
+        return 1;
     }
-  }
-
-  // Clean up
-  H5Dclose(dset_id);
-  H5Fclose(file_id);
-
-  // Remove the test file
-  remove(filename);
-
-  printf("read_chunk_fast and write_chunk_fast test PASSED\n");
-  return 0;
+    printf("  PASS\n");
+    return 0;
 }
 
-// Main test function
-int main() {
-  printf("Testing tensor_store.c functions...\n");
+static int test_calculate_chunk_dims(void)
+{
+    printf("Testing calculate_chunk_dims...\n");
 
-  int result = 0;
+    /* Large tensor: chunk side should be ~64 for rank-3, 2 MB target. */
+    hsize_t global_large[] = {1000, 1000, 1000};
+    hsize_t chunk_large[3];
+    calculate_chunk_dims(2 * 1024 * 1024, 3, global_large, chunk_large);
+    for (int d = 0; d < 3; d++) {
+        if (chunk_large[d] < 1 || chunk_large[d] > 1000) {
+            printf("  FAIL: chunk_large[%d]=%llu out of range\n", d,
+                   (unsigned long long)chunk_large[d]);
+            return 1;
+        }
+    }
 
-  // Run all tests
-  result |= test_get_physical_offset();
-  result |= test_calculate_chunk_dims();
-  result |= test_create_chunked_dataset();
-  result |= test_read_write_chunk_fast();
+    /* Small tensor: chunk must be clamped to global size. */
+    hsize_t global_small[] = {4, 4, 4};
+    hsize_t chunk_small[3];
+    calculate_chunk_dims(2 * 1024 * 1024, 3, global_small, chunk_small);
+    for (int d = 0; d < 3; d++) {
+        if (chunk_small[d] != 4) {
+            printf("  FAIL: chunk_small[%d]=%llu expected 4\n", d,
+                   (unsigned long long)chunk_small[d]);
+            return 1;
+        }
+    }
 
-  if (result == 0) {
-    printf("All tensor_store.c tests PASSED!\n");
-  } else {
-    printf("Some tensor_store.c tests FAILED!\n");
-  }
+    printf("  PASS\n");
+    return 0;
+}
 
-  return result;
+static int test_create_chunked_dataset(void)
+{
+    printf("Testing create_chunked_dataset...\n");
+
+    const char *fname = "test_create.h5";
+    const char *dname = "tensor";
+    hsize_t dims[] = {100, 100};
+
+    if (create_chunked_dataset(fname, dname, 2, dims,
+                               2 * 1024 * 1024) < 0) {
+        printf("  FAIL: create_chunked_dataset returned error\n");
+        return 1;
+    }
+
+    hid_t file_id = H5Fopen(fname, H5F_ACC_RDONLY, H5P_DEFAULT);
+    if (file_id < 0) { printf("  FAIL: H5Fopen\n"); return 1; }
+
+    hid_t dset_id = H5Dopen2(file_id, dname, H5P_DEFAULT);
+    if (dset_id < 0) {
+        printf("  FAIL: H5Dopen2\n");
+        H5Fclose(file_id);
+        return 1;
+    }
+
+    H5Dclose(dset_id);
+    H5Fclose(file_id);
+    remove(fname);
+
+    printf("  PASS\n");
+    return 0;
+}
+
+static int test_read_write_chunk_fast(void)
+{
+    printf("Testing read_chunk_fast / write_chunk_fast (full tile)...\n");
+
+    const char *fname = "test_rw.h5";
+    const char *dname = "rw_tensor";
+    hsize_t dims[]       = {10, 10};
+    hsize_t chunk_dims[] = {10, 10};
+    hsize_t offset[]     = {0, 0};
+    const int rank = 2;
+
+    if (create_chunked_dataset(fname, dname, rank, dims,
+                               2 * 1024 * 1024) < 0) {
+        printf("  FAIL: create_chunked_dataset\n");
+        return 1;
+    }
+
+    hid_t file_id = H5Fopen(fname, H5F_ACC_RDWR, H5P_DEFAULT);
+    if (file_id < 0) { printf("  FAIL: H5Fopen\n"); return 1; }
+
+    hid_t dset_id = dset_open_no_cache(file_id, dname);
+    if (dset_id < 0) {
+        printf("  FAIL: dset_open_no_cache\n");
+        H5Fclose(file_id);
+        return 1;
+    }
+
+    double write_buf[100], read_buf[100];
+    for (int i = 0; i < 100; i++) write_buf[i] = (double)(i + 1);
+
+    if (write_chunk_fast(dset_id, offset, write_buf, rank, chunk_dims) < 0) {
+        printf("  FAIL: write_chunk_fast\n");
+        H5Dclose(dset_id); H5Fclose(file_id);
+        return 1;
+    }
+    if (read_chunk_fast(dset_id, offset, read_buf, rank, chunk_dims) < 0) {
+        printf("  FAIL: read_chunk_fast\n");
+        H5Dclose(dset_id); H5Fclose(file_id);
+        return 1;
+    }
+
+    for (int i = 0; i < 100; i++) {
+        if (write_buf[i] != read_buf[i]) {
+            printf("  FAIL: mismatch at %d (expected %g got %g)\n",
+                   i, write_buf[i], read_buf[i]);
+            H5Dclose(dset_id); H5Fclose(file_id);
+            return 1;
+        }
+    }
+
+    H5Dclose(dset_id);
+    H5Fclose(file_id);
+    remove(fname);
+    printf("  PASS\n");
+    return 0;
+}
+
+static int test_high_rank_tensor(void)
+{
+    printf("Testing 4-D tensor I/O...\n");
+
+    const char *fname = "test_4d.h5";
+    const char *dname = "tensor_4d";
+    const int   rank  = 4;
+
+    hsize_t global_dims[] = {10, 10, 10, 10};
+    hsize_t chunk_dims[]  = {5, 5, 5, 5};
+    hsize_t offset[]      = {5, 0, 5, 0};   /* fits exactly: 5+5=10 ≤ 10 */
+
+    if (create_chunked_dataset(fname, dname, rank, global_dims,
+                               2 * 1024 * 1024) < 0) {
+        printf("  FAIL: create_chunked_dataset\n");
+        return 1;
+    }
+
+    hid_t file_id = H5Fopen(fname, H5F_ACC_RDWR, H5P_DEFAULT);
+    if (file_id < 0) { printf("  FAIL: H5Fopen\n"); return 1; }
+
+    hid_t dset_id = dset_open_no_cache(file_id, dname);
+    if (dset_id < 0) {
+        H5Fclose(file_id);
+        printf("  FAIL: dset_open_no_cache\n");
+        return 1;
+    }
+
+    size_t nelems = 5*5*5*5;  /* 625 */
+    double *wbuf  = (double *)malloc(nelems * sizeof(double));
+    double *rbuf  = (double *)malloc(nelems * sizeof(double));
+    if (!wbuf || !rbuf) {
+        free(wbuf); free(rbuf);
+        H5Dclose(dset_id); H5Fclose(file_id);
+        printf("  FAIL: malloc\n");
+        return 1;
+    }
+
+    for (size_t i = 0; i < nelems; i++) wbuf[i] = (double)(i + 1) * 1.5;
+
+    int ret = 0;
+    if (write_chunk_fast(dset_id, offset, wbuf, rank, chunk_dims) < 0) {
+        printf("  FAIL: write_chunk_fast\n"); ret = 1;
+    }
+    if (!ret &&
+        read_chunk_fast(dset_id, offset, rbuf, rank, chunk_dims) < 0) {
+        printf("  FAIL: read_chunk_fast\n"); ret = 1;
+    }
+    if (!ret) {
+        for (size_t i = 0; i < nelems; i++) {
+            if (wbuf[i] != rbuf[i]) {
+                printf("  FAIL: mismatch at %zu (expected %g got %g)\n",
+                       i, wbuf[i], rbuf[i]);
+                ret = 1;
+                break;
+            }
+        }
+    }
+
+    free(wbuf); free(rbuf);
+    H5Dclose(dset_id); H5Fclose(file_id);
+    remove(fname);
+    if (!ret) printf("  PASS\n");
+    return ret;
+}
+
+static int test_small_chunks_and_boundaries(void)
+{
+    printf("Testing boundary clamping with nominal-stride buffer layout...\n");
+
+    const char *fname = "test_boundary.h5";
+    const char *dname = "tensor_2d";
+    const int   rank  = 2;
+
+    hsize_t global_dims[] = {25, 25};
+    hsize_t chunk_dims[]  = {10, 10};
+
+    if (create_chunked_dataset(fname, dname, rank, global_dims,
+                               2 * 1024 * 1024) < 0) {
+        printf("  FAIL: create_chunked_dataset\n");
+        return 1;
+    }
+
+    hid_t file_id = H5Fopen(fname, H5F_ACC_RDWR, H5P_DEFAULT);
+    if (file_id < 0) { printf("  FAIL: H5Fopen\n"); return 1; }
+
+    hid_t dset_id = dset_open_no_cache(file_id, dname);
+    if (dset_id < 0) {
+        H5Fclose(file_id);
+        printf("  FAIL: dset_open_no_cache\n");
+        return 1;
+    }
+
+    double wbuf[100], rbuf[100];
+    /* Sequential fill: wbuf[i] = i+1. */
+    for (int i = 0; i < 100; i++) wbuf[i] = (double)(i + 1);
+
+    /* --- Full tile at origin --- */
+    hsize_t off_origin[] = {0, 0};
+    if (write_chunk_fast(dset_id, off_origin, wbuf, rank, chunk_dims) < 0 ||
+        read_chunk_fast (dset_id, off_origin, rbuf, rank, chunk_dims) < 0) {
+        printf("  FAIL: origin tile I/O\n");
+        H5Dclose(dset_id); H5Fclose(file_id); return 1;
+    }
+    for (int i = 0; i < 100; i++) {
+        if (wbuf[i] != rbuf[i]) {
+            printf("  FAIL: origin mismatch at %d\n", i);
+            H5Dclose(dset_id); H5Fclose(file_id); return 1;
+        }
+    }
+
+    /*
+     * --- Boundary tile at [20, 20] ---
+     *
+     * Dataset is 25×25; nominal chunk is 10×10.
+     * Actual extent: 5×5 (25-20=5 in each dim).
+     *
+     * write_chunk_fast: memspace=10×10 with selection [0..4,0..4] at origin.
+     *   wbuf[row*10+col] for row<5, col<5 → file[20+row, 20+col]
+     *
+     * read_chunk_fast:  rbuf is pre-zeroed; memspace=10×10 with selection
+     *   [0..4,0..4].  rbuf[row*10+col] = wbuf[row*10+col] for row<5,col<5.
+     *   rbuf[row*10+col] = 0 for col>=5 (padding, never written).
+     */
+    hsize_t off_edge[] = {20, 20};
+    memset(rbuf, 0, sizeof(rbuf));
+
+    if (write_chunk_fast(dset_id, off_edge, wbuf, rank, chunk_dims) < 0 ||
+        read_chunk_fast (dset_id, off_edge, rbuf, rank, chunk_dims) < 0) {
+        printf("  FAIL: boundary tile I/O\n");
+        H5Dclose(dset_id); H5Fclose(file_id); return 1;
+    }
+
+    /* Verify valid region: strided positions [row*10+col], row<5, col<5. */
+    for (int row = 0; row < 5; row++) {
+        for (int col = 0; col < 5; col++) {
+            int idx = row * 10 + col;
+            if (rbuf[idx] != wbuf[idx]) {
+                printf("  FAIL: boundary valid region mismatch at "
+                       "[%d,%d] (idx=%d)  expected=%g got=%g\n",
+                       row, col, idx, wbuf[idx], rbuf[idx]);
+                H5Dclose(dset_id); H5Fclose(file_id); return 1;
+            }
+        }
+    }
+
+    /* Verify padding region is zero. */
+    for (int row = 0; row < 5; row++) {
+        for (int col = 5; col < 10; col++) {
+            if (rbuf[row * 10 + col] != 0.0) {
+                printf("  FAIL: padding at [%d,%d] not zero (got %g)\n",
+                       row, col, rbuf[row * 10 + col]);
+                H5Dclose(dset_id); H5Fclose(file_id); return 1;
+            }
+        }
+    }
+
+    H5Dclose(dset_id);
+    H5Fclose(file_id);
+    remove(fname);
+    printf("  PASS\n");
+    return 0;
+}
+
+int main(void)
+{
+    printf("=== tensor_store tests ===\n");
+    int result = 0;
+    result |= test_get_physical_offset();
+    result |= test_calculate_chunk_dims();
+    result |= test_create_chunked_dataset();
+    result |= test_read_write_chunk_fast();
+    result |= test_high_rank_tensor();
+    result |= test_small_chunks_and_boundaries();
+    printf(result == 0 ? "\nAll tests PASSED\n" : "\nSome tests FAILED\n");
+    return result;
 }
