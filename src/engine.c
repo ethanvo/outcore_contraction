@@ -1415,28 +1415,63 @@ static int exec_macroblock_gcd(const ContractionShared *sh,
 
     int ret = 0;
 
-    char *A_cache_base = NULL;
-    char *A_perm_buf   = NULL;
-    char *B_raw_buf    = NULL;
-    char *B_perm_base  = NULL;
-    char *C_blas_base  = NULL;
-    char *C_accum_base = NULL;
-    MBTask *tasks  = NULL;
-    int    *A_exist = NULL;
+    char   *A_cache_base  = NULL;
+    char   *A_perm_buf    = NULL;
+    char   *B_raw_buf     = NULL;
+    char   *B_perm_buf[2] = {NULL, NULL};  /* ping-pong double buffers */
+    char   *C_blas_base   = NULL;
+    char   *C_accum_base  = NULL;
+    MBTask *tasks_buf[2]  = {NULL, NULL};
+    int    *A_exist       = NULL;
+    hsize_t *con_all      = NULL;          /* contracted-pair coord array */
 
-    MB_ALLOC(A_cache_base, total_con);
-    MB_ALLOC(A_perm_buf,   1);
-    MB_ALLOC(B_raw_buf,    1);
-    MB_ALLOC(B_perm_base,  total_fB);
-    MB_ALLOC(C_blas_base,  total_fB);
-    MB_ALLOC(C_accum_base, total_fB);
+    /* GCD objects — declared here (before any goto) and initialised below. */
+#ifdef HAS_GCD
+    dispatch_queue_t     b_io_q   = NULL;
+    dispatch_semaphore_t b_sem0   = NULL;
+    dispatch_semaphore_t b_sem1   = NULL;
+    int                 *b_io_err = NULL;  /* heap[2]: [0]=slot0, [1]=slot1 */
+#endif
 
-    tasks   = (MBTask *)malloc(total_fB * sizeof(MBTask));
-    A_exist = (int    *)malloc(total_con * sizeof(int));
-    if (!tasks || !A_exist) {
-        fprintf(stderr, "exec_macroblock_gcd: tasks/A_exist malloc failed\n");
+    MB_ALLOC(A_cache_base,  total_con);
+    MB_ALLOC(A_perm_buf,    1);
+    MB_ALLOC(B_raw_buf,     1);
+    MB_ALLOC(B_perm_buf[0], total_fB);
+    MB_ALLOC(B_perm_buf[1], total_fB);
+    MB_ALLOC(C_blas_base,   total_fB);
+    MB_ALLOC(C_accum_base,  total_fB);
+
+    tasks_buf[0] = (MBTask *)malloc(total_fB * sizeof(MBTask));
+    tasks_buf[1] = (MBTask *)malloc(total_fB * sizeof(MBTask));
+    A_exist      = (int    *)malloc(total_con * sizeof(int));
+    con_all      = (hsize_t *)malloc(total_con * MAX_RANK * sizeof(hsize_t));
+    if (!tasks_buf[0] || !tasks_buf[1] || !A_exist || !con_all) {
+        fprintf(stderr, "exec_macroblock_gcd: tasks/A_exist/con_all malloc failed\n");
         goto mb_cleanup;
     }
+
+    /* Pre-compute contracted-pair coordinates once (used by async B prefetch). */
+    {
+        size_t con[MAX_RANK];
+        memset(con, 0, sizeof(con));
+        size_t cf = 0;
+        do {
+            for (int d = 0; d < n_con; d++)
+                con_all[cf * MAX_RANK + (size_t)d] = (hsize_t)con[(size_t)d];
+            cf++;
+        } while (odometer_step((size_t)n_con, con, con_grid));
+    }
+
+#ifdef HAS_GCD
+    b_io_q  = dispatch_queue_create("mb.b_io", DISPATCH_QUEUE_SERIAL);
+    b_sem0  = dispatch_semaphore_create(0);
+    b_sem1  = dispatch_semaphore_create(0);
+    b_io_err = (int *)calloc(2, sizeof(int));
+    if (!b_io_q || !b_sem0 || !b_sem1 || !b_io_err) {
+        fprintf(stderr, "exec_macroblock_gcd: GCD init failed\n");
+        goto mb_cleanup;
+    }
+#endif
 
 #undef MB_ALLOC
 
@@ -1492,76 +1527,65 @@ static int exec_macroblock_gcd(const ContractionShared *sh,
         memset(C_accum_base, 0, total_fB * bpp);
 
         /* -------------------------------------------------------------- */
-        /* Step 3: Contracted loop — serial B I/O, GCD-parallel BLAS      */
+        /* Step 3: Contracted loop — double-buffered B I/O + GCD BLAS    */
+        /*                                                                */
+        /* While BLAS runs on slot S, the serial b_io_q loads the next   */
+        /* contracted pair's B tiles into slot 1-S (ping-pong).          */
         /* -------------------------------------------------------------- */
+#ifdef HAS_GCD
         {
-            size_t con[MAX_RANK];
-            memset(con, 0, sizeof(con));
-            size_t cf = 0;
+            b_io_err[0] = 0;
+            b_io_err[1] = 0;
 
-            do {
-                if (!A_exist[cf]) { cf++; continue; }
+            /* Scalar aliases: blocks can't capture arrays by value. */
+            char   *b_pb0 = B_perm_buf[0];
+            char   *b_pb1 = B_perm_buf[1];
+            MBTask *tb0   = tasks_buf[0];
+            MBTask *tb1   = tasks_buf[1];
+            size_t *fbg   = fb_grid;        /* non-const ptr for odometer */
 
-                /* Reconstruct A tile metadata for phys extents. */
-                hsize_t a_tile[MAX_RANK];
-                memset(a_tile, 0, sizeof(a_tile));
-                for (int p = 0; p < n_fA; p++)
-                    a_tile[(size_t)plan->perm_A[p]] = (hsize_t)fa_coord[(size_t)p];
-                for (int d = 0; d < n_con; d++)
-                    a_tile[(size_t)plan->perm_A[n_fA + d]] = (hsize_t)con[(size_t)d];
-                TileMetadata *mA = registry_get_tile(sh->reg_A, a_tile);
-
-                size_t phys_A[MAX_RANK];
-                for (int d = 0; d < rank_A; d++) {
-                    hsize_t end = mA->phys_offset[(size_t)d]
-                                + sh->reg_A->chunk_dims[(size_t)d];
-                    phys_A[(size_t)d] = (size_t)(
-                        (end > sh->reg_A->global_dims[(size_t)d])
-                        ? sh->reg_A->global_dims[(size_t)d]
-                          - mA->phys_offset[(size_t)d]
-                        : sh->reg_A->chunk_dims[(size_t)d]);
+            /* B-slot loader: reads all free_B B tiles for contracted pair
+             * cf_idx into slot bslot, then signals the slot's semaphore.
+             * Runs on serial b_io_q — B_raw_buf is exclusively owned by it. */
+            void (^load_b)(size_t, int) = ^(size_t cf_idx, int bslot) {
+                /* Skip I/O entirely if A tile for this pair is absent. */
+                if (!A_exist[cf_idx]) {
+                    b_io_err[bslot] = 0;
+                    dispatch_semaphore_signal(bslot == 0 ? b_sem0 : b_sem1);
+                    return;
                 }
 
-                /* Permute A → A_perm_buf (once per contracted pair). */
-                char *rawA = A_cache_base + cf * bpp;
-                if (perm_is_identity(plan->perm_A, rank_A)) {
-                    memcpy(A_perm_buf, rawA, bpp);
-                } else {
-                    memset(A_perm_buf, 0, bpp);
-                    tensor_permute(rawA, A_perm_buf, (size_t)rank_A, phys_A,
-                                   sh->chunk_dims_A_sz, plan->perm_A, esz);
-                }
+                const hsize_t *con_row = con_all + cf_idx * MAX_RANK;
+                char   *Bpb   = (bslot == 0) ? b_pb0 : b_pb1;
+                MBTask *btask = (bslot == 0) ? tb0   : tb1;
 
-                /* ---- Serial B I/O for all free_B tiles -------------- */
-                {
-                    size_t fb[MAX_RANK];
-                    memset(fb, 0, sizeof(fb));
-                    size_t ff = 0;
-                    do {
-                        hsize_t b_tile[MAX_RANK];
-                        memset(b_tile, 0, sizeof(b_tile));
-                        for (int d = 0; d < n_con; d++)
-                            b_tile[(size_t)plan->perm_B[d]] = (hsize_t)con[(size_t)d];
-                        for (int q = 0; q < n_fB; q++)
-                            b_tile[(size_t)plan->perm_B[n_con + q]] =
-                                (hsize_t)fb[(size_t)q];
+                size_t fb[MAX_RANK];
+                memset(fb, 0, sizeof(fb));
+                size_t ff = 0;
+                int    err = 0;
 
-                        TileMetadata *mB = registry_get_tile(sh->reg_B, b_tile);
-                        tasks[ff].fb_exists =
-                            (mB && mB->status == TILE_STATUS_ON_DISK) ? 1 : 0;
+                do {
+                    hsize_t b_tile[MAX_RANK];
+                    memset(b_tile, 0, sizeof(b_tile));
+                    for (int d = 0; d < n_con; d++)
+                        b_tile[(size_t)plan->perm_B[d]] = con_row[(size_t)d];
+                    for (int q = 0; q < n_fB; q++)
+                        b_tile[(size_t)plan->perm_B[n_con + q]] =
+                            (hsize_t)fb[(size_t)q];
 
-                        if (tasks[ff].fb_exists) {
-                            memset(B_raw_buf, 0, bpp);
-                            if (read_chunk_typed(dset_B, mB->phys_offset,
-                                                 B_raw_buf, esz, rank_B,
-                                                 sh->reg_B->chunk_dims,
-                                                 sh->h5type_mem) < 0) {
-                                fprintf(stderr,
-                                        "exec_macroblock_gcd: B read error\n");
-                                ret = -1;
-                                goto mb_cleanup;
-                            }
+                    TileMetadata *mB = registry_get_tile(sh->reg_B, b_tile);
+                    btask[ff].fb_exists =
+                        (mB && mB->status == TILE_STATUS_ON_DISK) ? 1 : 0;
 
+                    if (btask[ff].fb_exists) {
+                        memset(B_raw_buf, 0, bpp);
+                        if (read_chunk_typed(dset_B, mB->phys_offset,
+                                             B_raw_buf, esz, rank_B,
+                                             sh->reg_B->chunk_dims,
+                                             sh->h5type_mem) < 0) {
+                            err = 1;
+                            btask[ff].fb_exists = 0;
+                        } else {
                             size_t phys_B[MAX_RANK];
                             for (int d = 0; d < rank_B; d++) {
                                 hsize_t end = mB->phys_offset[(size_t)d]
@@ -1572,9 +1596,7 @@ static int exec_macroblock_gcd(const ContractionShared *sh,
                                       - mB->phys_offset[(size_t)d]
                                     : sh->reg_B->chunk_dims[(size_t)d]);
                             }
-
-                            /* Permute B → B_perm[ff]. */
-                            char *bperm = B_perm_base + ff * bpp;
+                            char *bperm = Bpb + ff * bpp;
                             if (perm_is_identity(plan->perm_B, rank_B)) {
                                 memcpy(bperm, B_raw_buf, bpp);
                             } else {
@@ -1583,61 +1605,114 @@ static int exec_macroblock_gcd(const ContractionShared *sh,
                                                phys_B, sh->chunk_dims_B_sz,
                                                plan->perm_B, esz);
                             }
-
-                            /* Actual blas_phys for this (A,B) pair. */
-                            for (int p = 0; p < n_fA; p++)
-                                tasks[ff].blas_phys[(size_t)p] =
-                                    phys_A[(size_t)plan->perm_A[p]];
+                            /* Store free_B part of blas_phys; main thread
+                             * fills free_A part + is_boundary after wait. */
                             for (int q = 0; q < n_fB; q++)
-                                tasks[ff].blas_phys[(size_t)(n_fA + q)] =
+                                btask[ff].blas_phys[(size_t)(n_fA + q)] =
                                     phys_B[(size_t)plan->perm_B[n_con + q]];
+                        }
+                    }
+                    ff++;
+                } while (odometer_step((size_t)n_fB, fb, fbg));
 
-                            tasks[ff].is_boundary = 0;
-                            for (int d = 0; d < rank_C; d++) {
-                                if (tasks[ff].blas_phys[(size_t)d]
-                                        < sh->blas_dims[(size_t)d]) {
-                                    tasks[ff].is_boundary = 1;
-                                    break;
-                                }
+                b_io_err[bslot] = err;
+                dispatch_semaphore_signal(bslot == 0 ? b_sem0 : b_sem1);
+            };
+
+            /* Kickstart pipeline: prefetch cf=0 → slot 0, cf=1 → slot 1. */
+            dispatch_async(b_io_q, ^{ load_b(0, 0); });
+            if (total_con > 1)
+                dispatch_async(b_io_q, ^{ load_b(1, 1); });
+
+            size_t cf = 0;
+            while (cf < total_con) {
+                int bslot = (int)(cf % 2);
+
+                /* Wait for slot's B tiles to be ready. */
+                dispatch_semaphore_wait(bslot == 0 ? b_sem0 : b_sem1,
+                                        DISPATCH_TIME_FOREVER);
+
+                int ioerr = b_io_err[bslot];
+                if (ioerr) {
+                    fprintf(stderr,
+                            "exec_macroblock_gcd: async B read error\n");
+                    ret = -1;
+                    goto mb_cleanup;
+                }
+
+                if (A_exist[cf]) {
+                    /* Reconstruct A phys for this contracted pair. */
+                    const hsize_t *con_row = con_all + cf * MAX_RANK;
+                    hsize_t a_tile[MAX_RANK];
+                    memset(a_tile, 0, sizeof(a_tile));
+                    for (int p = 0; p < n_fA; p++)
+                        a_tile[(size_t)plan->perm_A[p]] =
+                            (hsize_t)fa_coord[(size_t)p];
+                    for (int d = 0; d < n_con; d++)
+                        a_tile[(size_t)plan->perm_A[n_fA + d]] =
+                            con_row[(size_t)d];
+                    TileMetadata *mA = registry_get_tile(sh->reg_A, a_tile);
+
+                    size_t phys_A[MAX_RANK];
+                    for (int d = 0; d < rank_A; d++) {
+                        hsize_t end = mA->phys_offset[(size_t)d]
+                                    + sh->reg_A->chunk_dims[(size_t)d];
+                        phys_A[(size_t)d] = (size_t)(
+                            (end > sh->reg_A->global_dims[(size_t)d])
+                            ? sh->reg_A->global_dims[(size_t)d]
+                              - mA->phys_offset[(size_t)d]
+                            : sh->reg_A->chunk_dims[(size_t)d]);
+                    }
+
+                    char *rawA = A_cache_base + cf * bpp;
+                    if (perm_is_identity(plan->perm_A, rank_A)) {
+                        memcpy(A_perm_buf, rawA, bpp);
+                    } else {
+                        memset(A_perm_buf, 0, bpp);
+                        tensor_permute(rawA, A_perm_buf, (size_t)rank_A,
+                                       phys_A, sh->chunk_dims_A_sz,
+                                       plan->perm_A, esz);
+                    }
+
+                    /* Fill free_A part of blas_phys + is_boundary. */
+                    MBTask *btask = (bslot == 0) ? tb0 : tb1;
+                    for (size_t ff2 = 0; ff2 < total_fB; ff2++) {
+                        if (!btask[ff2].fb_exists) continue;
+                        for (int p = 0; p < n_fA; p++)
+                            btask[ff2].blas_phys[(size_t)p] =
+                                phys_A[(size_t)plan->perm_A[p]];
+                        btask[ff2].is_boundary = 0;
+                        for (int d = 0; d < rank_C; d++) {
+                            if (btask[ff2].blas_phys[(size_t)d]
+                                    < sh->blas_dims[(size_t)d]) {
+                                btask[ff2].is_boundary = 1;
+                                break;
                             }
                         }
-                        ff++;
-                    } while (odometer_step((size_t)n_fB, fb, fb_grid));
-                } /* end serial B I/O */
+                    }
 
-                /* ---- GCD parallel BLAS over all free_B tiles ---------- */
-                /*                                                          */
-                /* Captured by value (pointer values; underlying data       */
-                /* is stable and task-private for write targets):           */
-                /*   A_perm_buf  → read-only, shared                        */
-                /*   B_perm_base → task reads [ff]*bpp, no conflicts        */
-                /*   C_blas_base → task writes [ff]*bpp, disjoint           */
-                /*   C_accum_base→ task accumulates [ff]*bpp, disjoint     */
-                /*   tasks[]     → read-only metadata per task              */
-                /* -------------------------------------------------------- */
-                {
+                    /* GCD parallel BLAS — dispatch_apply is synchronous;
+                     * slot is free to recycle once it returns.            */
                     const char   *cap_Ap    = A_perm_buf;
-                    const char   *cap_Bp    = B_perm_base;
+                    const char   *cap_Bp    = (bslot == 0) ? b_pb0 : b_pb1;
                     char         *cap_Cb    = C_blas_base;
                     char         *cap_Ca    = C_accum_base;
-                    const MBTask *cap_tasks = tasks;
+                    const MBTask *cap_tasks = (bslot == 0) ? tb0 : tb1;
                     const size_t *cap_sidx  = sh->scatter_idx;
                     const size_t *cap_bstr  = sh->blas_strides;
                     size_t cap_tblas        = sh->total_blas;
-                    int cap_Mn = sh->M_nom, cap_Kn = sh->K_nom, cap_Nn = sh->N_nom;
+                    int cap_Mn = sh->M_nom, cap_Kn = sh->K_nom,
+                        cap_Nn = sh->N_nom;
                     int cap_rC = rank_C;
                     int cap_cx = is_cplx;
                     size_t cap_bpp = bpp;
 
-#ifdef HAS_GCD
-                    dispatch_apply(total_fB, DISPATCH_APPLY_AUTO, ^(size_t ff) {
-                        if (!cap_tasks[ff].fb_exists) return;
+                    dispatch_apply(total_fB, DISPATCH_APPLY_AUTO, ^(size_t ff2) {
+                        if (!cap_tasks[ff2].fb_exists) return;
 
-                        const void *bB  = cap_Bp + ff * cap_bpp;
-                        void       *bCb = cap_Cb + ff * cap_bpp;
-                        void       *bCa = cap_Ca + ff * cap_bpp;
-
-                        /* BLAS: C_blas = A_perm × B_perm (beta=0, overwrite) */
+                        const void *bB  = cap_Bp + ff2 * cap_bpp;
+                        void       *bCb = cap_Cb + ff2 * cap_bpp;
+                        void       *bCa = cap_Ca + ff2 * cap_bpp;
 #ifdef TENSOR_ZGEMM
                         if (!cap_cx) {
                             double alpha = 1.0, beta = 0.0;
@@ -1654,16 +1729,16 @@ static int exec_macroblock_gcd(const ContractionShared *sh,
                                          CblasNoTrans, CblasNoTrans,
                                          cap_Mn, cap_Nn, cap_Kn,
                                          &alpha,
-                                         (const double _Complex *)cap_Ap, cap_Kn,
+                                         (const double _Complex *)cap_Ap,
+                                         cap_Kn,
                                          (const double _Complex *)bB, cap_Nn,
-                                         &beta, (double _Complex *)bCb, cap_Nn);
+                                         &beta,
+                                         (double _Complex *)bCb, cap_Nn);
                         }
 #else
-                        /* No BLAS: zero the output buffer. */
                         memset(bCb, 0, cap_bpp);
 #endif
-                        /* Scatter-accumulate C_blas → C_accum[ff] */
-                        if (!cap_tasks[ff].is_boundary) {
+                        if (!cap_tasks[ff2].is_boundary) {
                             if (!cap_cx) {
                                 const double *src = (const double *)bCb;
                                 double       *dst = (      double *)bCa;
@@ -1678,7 +1753,6 @@ static int exec_macroblock_gcd(const ContractionShared *sh,
                                     dst[cap_sidx[f]] += src[f];
                             }
                         } else {
-                            /* Slow boundary path: iterate only valid elements. */
                             size_t bc[MAX_RANK];
                             memset(bc, 0, (size_t)cap_rC * sizeof(size_t));
                             do {
@@ -1691,74 +1765,192 @@ static int exec_macroblock_gcd(const ContractionShared *sh,
                                     ((double _Complex *)bCa)[cap_sidx[bf]] +=
                                         ((const double _Complex *)bCb)[bf];
                             } while (odometer_step((size_t)cap_rC, bc,
-                                                   cap_tasks[ff].blas_phys));
+                                                   cap_tasks[ff2].blas_phys));
                         }
                     }); /* dispatch_apply */
-#else
-                    /* Serial fallback on non-Apple platforms. */
+                } /* if A_exist[cf] */
+
+                /* dispatch_apply returned → slot is free.  Recycle it for
+                 * contracted pair cf+2 (if any remain beyond cf+1).       */
+                if (cf + 2 < total_con)
+                    dispatch_async(b_io_q, ^{ load_b(cf + 2, bslot); });
+
+                cf++;
+            } /* while contracted loop (GCD) */
+        } /* end double-buffered block */
+#else /* !HAS_GCD — serial contracted loop */
+        {
+            size_t cf = 0;
+            while (cf < total_con) {
+                if (!A_exist[cf]) { cf++; continue; }
+
+                const hsize_t *con_row = con_all + cf * MAX_RANK;
+
+                hsize_t a_tile[MAX_RANK];
+                memset(a_tile, 0, sizeof(a_tile));
+                for (int p = 0; p < n_fA; p++)
+                    a_tile[(size_t)plan->perm_A[p]] =
+                        (hsize_t)fa_coord[(size_t)p];
+                for (int d = 0; d < n_con; d++)
+                    a_tile[(size_t)plan->perm_A[n_fA + d]] = con_row[(size_t)d];
+                TileMetadata *mA = registry_get_tile(sh->reg_A, a_tile);
+
+                size_t phys_A[MAX_RANK];
+                for (int d = 0; d < rank_A; d++) {
+                    hsize_t end = mA->phys_offset[(size_t)d]
+                                + sh->reg_A->chunk_dims[(size_t)d];
+                    phys_A[(size_t)d] = (size_t)(
+                        (end > sh->reg_A->global_dims[(size_t)d])
+                        ? sh->reg_A->global_dims[(size_t)d]
+                          - mA->phys_offset[(size_t)d]
+                        : sh->reg_A->chunk_dims[(size_t)d]);
+                }
+
+                char *rawA = A_cache_base + cf * bpp;
+                if (perm_is_identity(plan->perm_A, rank_A)) {
+                    memcpy(A_perm_buf, rawA, bpp);
+                } else {
+                    memset(A_perm_buf, 0, bpp);
+                    tensor_permute(rawA, A_perm_buf, (size_t)rank_A, phys_A,
+                                   sh->chunk_dims_A_sz, plan->perm_A, esz);
+                }
+
+                /* Serial B I/O. */
+                {
+                    MBTask *btask = tasks_buf[0];
+                    size_t fb[MAX_RANK];
+                    memset(fb, 0, sizeof(fb));
+                    size_t ff = 0;
+                    do {
+                        hsize_t b_tile[MAX_RANK];
+                        memset(b_tile, 0, sizeof(b_tile));
+                        for (int d = 0; d < n_con; d++)
+                            b_tile[(size_t)plan->perm_B[d]] =
+                                con_row[(size_t)d];
+                        for (int q = 0; q < n_fB; q++)
+                            b_tile[(size_t)plan->perm_B[n_con + q]] =
+                                (hsize_t)fb[(size_t)q];
+
+                        TileMetadata *mB = registry_get_tile(sh->reg_B, b_tile);
+                        btask[ff].fb_exists =
+                            (mB && mB->status == TILE_STATUS_ON_DISK) ? 1 : 0;
+
+                        if (btask[ff].fb_exists) {
+                            memset(B_raw_buf, 0, bpp);
+                            if (read_chunk_typed(dset_B, mB->phys_offset,
+                                                 B_raw_buf, esz, rank_B,
+                                                 sh->reg_B->chunk_dims,
+                                                 sh->h5type_mem) < 0) {
+                                fprintf(stderr,
+                                        "exec_macroblock_gcd: B read error\n");
+                                ret = -1;
+                                goto mb_cleanup;
+                            }
+                            size_t phys_B[MAX_RANK];
+                            for (int d = 0; d < rank_B; d++) {
+                                hsize_t end = mB->phys_offset[(size_t)d]
+                                            + sh->reg_B->chunk_dims[(size_t)d];
+                                phys_B[(size_t)d] = (size_t)(
+                                    (end > sh->reg_B->global_dims[(size_t)d])
+                                    ? sh->reg_B->global_dims[(size_t)d]
+                                      - mB->phys_offset[(size_t)d]
+                                    : sh->reg_B->chunk_dims[(size_t)d]);
+                            }
+                            char *bperm = B_perm_buf[0] + ff * bpp;
+                            if (perm_is_identity(plan->perm_B, rank_B)) {
+                                memcpy(bperm, B_raw_buf, bpp);
+                            } else {
+                                memset(bperm, 0, bpp);
+                                tensor_permute(B_raw_buf, bperm, (size_t)rank_B,
+                                               phys_B, sh->chunk_dims_B_sz,
+                                               plan->perm_B, esz);
+                            }
+                            for (int p = 0; p < n_fA; p++)
+                                btask[ff].blas_phys[(size_t)p] =
+                                    phys_A[(size_t)plan->perm_A[p]];
+                            for (int q = 0; q < n_fB; q++)
+                                btask[ff].blas_phys[(size_t)(n_fA + q)] =
+                                    phys_B[(size_t)plan->perm_B[n_con + q]];
+                            btask[ff].is_boundary = 0;
+                            for (int d = 0; d < rank_C; d++) {
+                                if (btask[ff].blas_phys[(size_t)d]
+                                        < sh->blas_dims[(size_t)d]) {
+                                    btask[ff].is_boundary = 1; break;
+                                }
+                            }
+                        }
+                        ff++;
+                    } while (odometer_step((size_t)n_fB, fb, fb_grid));
+                }
+
+                /* Serial BLAS. */
+                {
+                    MBTask *btask = tasks_buf[0];
                     for (size_t ff = 0; ff < total_fB; ff++) {
-                        if (!cap_tasks[ff].fb_exists) continue;
-
-                        const void *bB  = cap_Bp + ff * cap_bpp;
-                        void       *bCb = cap_Cb + ff * cap_bpp;
-                        void       *bCa = cap_Ca + ff * cap_bpp;
-
+                        if (!btask[ff].fb_exists) continue;
+                        const void *bB  = B_perm_buf[0] + ff * bpp;
+                        void       *bCb = C_blas_base   + ff * bpp;
+                        void       *bCa = C_accum_base  + ff * bpp;
 #ifdef TENSOR_ZGEMM
-                        if (!cap_cx) {
+                        if (!is_cplx) {
                             double alpha = 1.0, beta = 0.0;
                             TENSOR_DGEMM(CblasRowMajor,
                                          CblasNoTrans, CblasNoTrans,
-                                         cap_Mn, cap_Nn, cap_Kn,
-                                         alpha, cap_Ap, cap_Kn,
-                                         bB, cap_Nn,
-                                         beta, bCb, cap_Nn);
+                                         sh->M_nom, sh->N_nom, sh->K_nom,
+                                         alpha,
+                                         (const double *)A_perm_buf, sh->K_nom,
+                                         (const double *)bB, sh->N_nom,
+                                         beta, (double *)bCb, sh->N_nom);
                         } else {
                             double _Complex alpha = CMPLX(1.0, 0.0);
                             double _Complex beta  = CMPLX(0.0, 0.0);
                             TENSOR_ZGEMM(CblasRowMajor,
                                          CblasNoTrans, CblasNoTrans,
-                                         cap_Mn, cap_Nn, cap_Kn,
-                                         &alpha, cap_Ap, cap_Kn,
-                                         bB, cap_Nn,
-                                         &beta, bCb, cap_Nn);
+                                         sh->M_nom, sh->N_nom, sh->K_nom,
+                                         &alpha,
+                                         (const double _Complex *)A_perm_buf,
+                                         sh->K_nom,
+                                         (const double _Complex *)bB, sh->N_nom,
+                                         &beta,
+                                         (double _Complex *)bCb, sh->N_nom);
                         }
 #endif
-                        if (!cap_tasks[ff].is_boundary) {
-                            if (!cap_cx) {
+                        if (!btask[ff].is_boundary) {
+                            if (!is_cplx) {
                                 const double *src = (const double *)bCb;
                                 double       *dst = (      double *)bCa;
-                                for (size_t f = 0; f < cap_tblas; f++)
-                                    dst[cap_sidx[f]] += src[f];
+                                for (size_t f = 0; f < sh->total_blas; f++)
+                                    dst[sh->scatter_idx[f]] += src[f];
                             } else {
                                 const double _Complex *src =
                                     (const double _Complex *)bCb;
                                 double _Complex *dst =
                                     (      double _Complex *)bCa;
-                                for (size_t f = 0; f < cap_tblas; f++)
-                                    dst[cap_sidx[f]] += src[f];
+                                for (size_t f = 0; f < sh->total_blas; f++)
+                                    dst[sh->scatter_idx[f]] += src[f];
                             }
                         } else {
                             size_t bc[MAX_RANK];
-                            memset(bc, 0, (size_t)cap_rC * sizeof(size_t));
+                            memset(bc, 0, (size_t)rank_C * sizeof(size_t));
                             do {
                                 size_t bf = compute_flat_index(
-                                    (size_t)cap_rC, bc, cap_bstr);
-                                if (!cap_cx)
-                                    ((double *)bCa)[cap_sidx[bf]] +=
+                                    (size_t)rank_C, bc, sh->blas_strides);
+                                if (!is_cplx)
+                                    ((double *)bCa)[sh->scatter_idx[bf]] +=
                                         ((const double *)bCb)[bf];
                                 else
-                                    ((double _Complex *)bCa)[cap_sidx[bf]] +=
+                                    ((double _Complex *)bCa)
+                                        [sh->scatter_idx[bf]] +=
                                         ((const double _Complex *)bCb)[bf];
-                            } while (odometer_step((size_t)cap_rC, bc,
-                                                   cap_tasks[ff].blas_phys));
+                            } while (odometer_step((size_t)rank_C, bc,
+                                                   btask[ff].blas_phys));
                         }
-                    } /* serial fallback loop */
-#endif /* HAS_GCD */
-                } /* end BLAS block */
-
+                    }
+                }
                 cf++;
-            } while (odometer_step((size_t)n_con, con, con_grid));
-        } /* end contracted loop */
+            } /* while contracted loop (!GCD) */
+        }
+#endif /* HAS_GCD */
 
         /* -------------------------------------------------------------- */
         /* Step 4: Write all completed C tiles for this macro-block       */
@@ -1806,11 +1998,24 @@ static int exec_macroblock_gcd(const ContractionShared *sh,
     printf("\n");
 
 mb_cleanup:
+#ifdef HAS_GCD
+    /* Drain any in-flight B-load before freeing buffers, then release GCD. */
+    if (b_io_q) {
+        dispatch_sync(b_io_q, ^{});
+        dispatch_release(b_io_q);
+    }
+    if (b_sem0) dispatch_release(b_sem0);
+    if (b_sem1) dispatch_release(b_sem1);
+    free(b_io_err);
+#endif
+    free(con_all);
     free(A_exist);
-    free(tasks);
+    free(tasks_buf[1]);
+    free(tasks_buf[0]);
     free(C_accum_base);
     free(C_blas_base);
-    free(B_perm_base);
+    free(B_perm_buf[1]);
+    free(B_perm_buf[0]);
     free(B_raw_buf);
     free(A_perm_buf);
     free(A_cache_base);
