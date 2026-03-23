@@ -1,45 +1,42 @@
 #ifndef MEMORY_H
 #define MEMORY_H
 
-#include <stdlib.h>
+#include <stddef.h>
 
 typedef struct BufferPool BufferPool;
 
 /*
- * Creates a memory pool.
- * num_pages: Total number of slots available (e.g., 100).
- * elements_per_page: Size of one slot in doubles (e.g., 64*64*64 = 262144).
+ * Allocate a pool of num_pages pages, each bytes_per_page bytes in size.
+ * All pages reside in a single contiguous allocation.
+ *
+ * For FP64 tensors: bytes_per_page = elements_per_page * sizeof(double).
+ * For COMPLEX128:   bytes_per_page = elements_per_page * sizeof(double _Complex).
  */
-BufferPool *pool_create(size_t num_pages, size_t elements_per_page);
+BufferPool *pool_create(size_t num_pages, size_t bytes_per_page);
 
-/*
- * Destroys the pool and frees all memory.
- */
+/* Release all pool memory. */
 void pool_destroy(BufferPool *pool);
 
 /*
- * Acquires a pointer to a free memory page.
- * out_id: (Output) Stores the unique ID of the page (0 to N-1).
- * You need this ID to release the page later.
- * Returns: Pointer to the memory, or NULL if pool is empty.
+ * Acquire a free page.  *out_id receives the page's ID (0 … num_pages-1).
+ * Use SIZE_MAX as the "not acquired" sentinel when initialising an ID before
+ * a matching pool_acquire call.
+ * Returns a pointer to the page's raw memory, or NULL if the pool is exhausted.
+ * Callers cast the returned pointer to the appropriate element type.
  */
-double *pool_acquire(BufferPool *pool, int *out_id);
+void *pool_acquire(BufferPool *pool, size_t *out_id);
 
 /*
- * Returns a page to the pool, making it available for reuse.
- * page_id: The ID obtained during pool_acquire.
+ * Return page page_id to the free stack.
+ * Passing SIZE_MAX or any out-of-range value is a no-op (logged to stderr).
  */
-void pool_release(BufferPool *pool, int page_id);
+void pool_release(BufferPool *pool, size_t page_id);
 
-/*
- * Helper: Get the pointer for a specific ID without "acquiring" it.
- * Useful for debugging or lookups if you already hold the lock.
- */
-double *pool_get_ptr(BufferPool *pool, int page_id);
+/* Return a pointer to page page_id without acquiring it.  Returns NULL for
+ * out-of-range IDs (including SIZE_MAX). */
+void *pool_get_ptr(BufferPool *pool, size_t page_id);
 
-/*
- * Diagnostic: Returns number of currently free pages.
- */
+/* Number of currently free pages. */
 size_t pool_free_count(BufferPool *pool);
 
-#endif
+#endif /* MEMORY_H */
