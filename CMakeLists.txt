@@ -25,6 +25,7 @@ add_library(tensor_core STATIC
     src/odometer.c
     src/write_queue.c
     src/metal_backend.m
+    src/tensor_engine.c
 )
 # metal_backend.m must be compiled as Objective-C (not plain C).
 set_source_files_properties(src/metal_backend.m PROPERTIES
@@ -192,6 +193,13 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/bench_odd_strides_40gb.c)
     message(STATUS "  bench_odd_strides_40gb: enabled")
 endif()
 
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/bench_compute_bound_40gb.c)
+    add_executable(bench_compute_bound_40gb tests/bench_compute_bound_40gb.c)
+    target_link_libraries(bench_compute_bound_40gb PRIVATE tensor_core ${HDF5_C_LIBRARIES} m)
+    target_include_directories(bench_compute_bound_40gb PRIVATE ${HDF5_INCLUDE_DIRS})
+    message(STATUS "  bench_compute_bound_40gb: enabled")
+endif()
+
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_mixed_rank.c)
     add_executable(test_mixed_rank tests/test_mixed_rank.c)
     target_link_libraries(test_mixed_rank PRIVATE tensor_core ${HDF5_C_LIBRARIES} m)
@@ -211,6 +219,14 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_100gb_contraction.c)
     else()
         message(STATUS "  test_100gb_contraction: full scale (340^4 ≈ 106 GB / tensor)")
     endif()
+endif()
+
+# --- Consolidated benchmark suite ---
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/bench/run_all.c)
+    add_executable(bench_run_all bench/run_all.c)
+    target_link_libraries(bench_run_all PRIVATE tensor_core ${HDF5_C_LIBRARIES} m)
+    target_include_directories(bench_run_all PRIVATE include ${HDF5_INCLUDE_DIRS})
+    message(STATUS "  bench_run_all: enabled")
 endif()
 
 # --- Diagnostics ---
