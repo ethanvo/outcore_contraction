@@ -56,15 +56,27 @@ endif()
 # Auto-detect on Linux: OpenBLAS  → None
 #
 set(BLAS_BACKEND "Auto" CACHE STRING
-    "BLAS backend: Auto (default) | Accelerate | OpenBLAS | None")
-set_property(CACHE BLAS_BACKEND PROPERTY STRINGS Auto Accelerate OpenBLAS None)
+    "BLAS backend: Auto (default) | Accelerate | MKL | OpenBLAS | None")
+set_property(CACHE BLAS_BACKEND PROPERTY STRINGS Auto Accelerate MKL OpenBLAS None)
 
 # Normalise "Auto" to the best available backend.
 if(BLAS_BACKEND STREQUAL "Auto")
     if(APPLE)
         set(BLAS_BACKEND "Accelerate")
     else()
-        set(BLAS_BACKEND "OpenBLAS")
+        # Prefer MKL when MKLROOT is set or the oneAPI default path exists.
+        find_path(_mkl_probe mkl_cblas.h
+            PATHS
+                "$ENV{MKLROOT}/include"
+                /opt/intel/oneapi/mkl/latest/include
+                /opt/intel/mkl/include
+            NO_DEFAULT_PATH)
+        if(_mkl_probe)
+            set(BLAS_BACKEND "MKL")
+        else()
+            set(BLAS_BACKEND "OpenBLAS")
+        endif()
+        unset(_mkl_probe CACHE)
     endif()
 endif()
 
@@ -80,19 +92,85 @@ if(BLAS_BACKEND STREQUAL "Accelerate")
                         " – falling back to None")
     endif()
 
+elseif(BLAS_BACKEND STREQUAL "MKL")
+    find_path(MKL_INCLUDE_DIR mkl_cblas.h
+        PATHS
+            "$ENV{MKLROOT}/include"
+            /opt/intel/oneapi/mkl/latest/include
+            /opt/intel/mkl/include
+        NO_DEFAULT_PATH
+    )
+    find_library(MKL_CORE_LIB mkl_core
+        PATHS
+            "$ENV{MKLROOT}/lib"
+            "$ENV{MKLROOT}/lib/intel64"
+            /opt/intel/oneapi/mkl/latest/lib
+            /opt/intel/oneapi/mkl/latest/lib/intel64
+            /opt/intel/mkl/lib/intel64
+        NO_DEFAULT_PATH
+    )
+    # Intel OpenMP runtime — required by mkl_intel_thread.
+    # Search order: CMPLR_ROOT env var (standard oneAPI activation), the
+    # Spack view layout (view/compiler/VERSION beside view/mkl/VERSION),
+    # and the conventional bare-metal oneAPI install path.
+    # Version-specific subdirs are tried after the generic "latest" symlink
+    # so newer oneAPI releases work without changes here.
+    get_filename_component(_mkl_view_root "$ENV{MKLROOT}/../.." ABSOLUTE)
+    find_library(IOMP5_LIB iomp5
+        PATHS
+            "$ENV{CMPLR_ROOT}/linux/compiler/lib/intel64_lin"
+            "$ENV{CMPLR_ROOT}/lib"
+            "${_mkl_view_root}/compiler/latest/lib"
+            "${_mkl_view_root}/compiler/2025.3/lib"
+            "${_mkl_view_root}/compiler/2025.2/lib"
+            "${_mkl_view_root}/compiler/2025.1/lib"
+            /opt/intel/oneapi/compiler/latest/linux/compiler/lib/intel64_lin
+    )
+    if(MKL_INCLUDE_DIR AND MKL_CORE_LIB)
+        get_filename_component(MKL_LIB_DIR "${MKL_CORE_LIB}" DIRECTORY)
+        target_compile_definitions(tensor_core PRIVATE HAVE_CBLAS USE_MKL)
+        target_include_directories(tensor_core PRIVATE "${MKL_INCLUDE_DIR}")
+        target_link_directories(tensor_core PRIVATE "${MKL_LIB_DIR}")
+        if(IOMP5_LIB)
+            get_filename_component(IOMP5_LIB_DIR "${IOMP5_LIB}" DIRECTORY)
+            # mkl_intel_thread: multi-threaded via Intel OpenMP (iomp5).
+            # -fopenmp initialises the runtime; without it MKL silently
+            # falls back to 1 thread even when MKL_NUM_THREADS > 1.
+            target_compile_options(tensor_core PRIVATE -fopenmp)
+            target_link_directories(tensor_core PRIVATE "${IOMP5_LIB_DIR}")
+            target_link_libraries(tensor_core PRIVATE
+                mkl_intel_lp64 mkl_intel_thread mkl_core iomp5
+                pthread dl
+            )
+            message(STATUS "  BLAS        : Intel MKL threaded (iomp5, ${MKL_LIB_DIR})")
+        else()
+            # iomp5 not found — fall back to sequential layer.
+            target_link_libraries(tensor_core PRIVATE
+                mkl_intel_lp64 mkl_sequential mkl_core
+                pthread dl
+            )
+            message(STATUS "  BLAS        : Intel MKL sequential (iomp5 not found, ${MKL_LIB_DIR})")
+        endif()
+    else()
+        message(WARNING "  BLAS        : MKL requested but not found"
+                        " – falling back to None")
+    endif()
+
 elseif(BLAS_BACKEND STREQUAL "OpenBLAS")
     # find_package(BLAS) locates the library; we then separately find cblas.h
-    # because not all BLAS installs expose a C header in a standard location.
-    # The Spack prefix is checked first; common system paths are fallbacks.
+    # because not all installs place the header in a standard location.
+    # CMAKE_PREFIX_PATH is honoured first so Spack/vcpkg/Homebrew prefixes work
+    # without hardcoding machine-specific paths here.
     find_package(BLAS)
     if(BLAS_FOUND)
         find_path(CBLAS_INCLUDE_DIR cblas.h
+            PATH_SUFFIXES openblas
             PATHS
-                "$ENV{HOME}/builds/spack/develop/spack/opt/spack/darwin-m1/openblas-0.3.30-wr6cg4lreupuc5benwd5bp5hmnru66ug/include"
                 /usr/local/include
+                /opt/homebrew/include
                 /opt/homebrew/include/openblas
                 /usr/include/openblas
-            NO_DEFAULT_PATH
+                /usr/include
         )
         if(CBLAS_INCLUDE_DIR)
             target_compile_definitions(tensor_core PRIVATE HAVE_CBLAS)
