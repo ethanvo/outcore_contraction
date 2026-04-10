@@ -4,6 +4,7 @@
 #include "tensor_store.h"
 #include <hdf5.h>
 #include <pthread.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,6 +18,8 @@
 
 #ifdef USE_ACCELERATE
 #  include <Accelerate/Accelerate.h>
+#elif defined(USE_MKL)
+#  include <mkl_cblas.h>
 #elif defined(HAVE_CBLAS)
 #  include <cblas.h>
 #endif
@@ -505,7 +508,9 @@ int run_contraction(const char *file_A, const char *name_A,
            (double)(num_pages * elems_per_page * sizeof(double))
                / (1024.0 * 1024.0 * 1024.0));
 
-#ifdef HAVE_CBLAS
+#if defined(USE_MKL)
+    printf("Kernel: cblas_dgemm (Intel MKL)\n");
+#elif defined(HAVE_CBLAS)
     printf("Kernel: cblas_dgemm (OpenBLAS)\n");
 #else
     printf("Kernel: fallback (m\xe2\x86\x92k\xe2\x86\x92n loop)\n");
@@ -1013,7 +1018,9 @@ int run_contraction_4d(const char *file_A, const char *name_A,
 
     printf("Nominal chunk: (i=%d,j=%d,a=%d,b=%d)  BLAS M=%d K=%d N=%d\n",
            i_nom, j_nom, a_nom, b_nom, M_blas, K_blas, N_blas);
-#ifdef HAVE_CBLAS
+#if defined(USE_MKL)
+    printf("Kernel: cblas_dgemm (Intel MKL)\n");
+#elif defined(HAVE_CBLAS)
     printf("Kernel: cblas_dgemm (OpenBLAS)\n");
 #else
     printf("Kernel: fallback (m\xe2\x86\x92k\xe2\x86\x92n loop)\n");
@@ -2862,6 +2869,8 @@ int run_contraction_einsum(const char *expr,
     printf("BLAS: M=%d  K=%d  N=%d\n", M_nom, K_nom, N_nom);
 #ifdef USE_ACCELERATE
     printf("Kernel: cblas_dgemm/zgemm (Apple Accelerate/AMX)\n");
+#elif defined(USE_MKL)
+    printf("Kernel: cblas_dgemm/zgemm (Intel MKL)\n");
 #elif defined(HAVE_CBLAS)
     printf("Kernel: cblas_dgemm/zgemm (OpenBLAS)\n");
 #else

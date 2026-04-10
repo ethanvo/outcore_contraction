@@ -19,7 +19,7 @@ COMPLEX128 arithmetic: ~361 GFLOPS sustained while keeping NVMe I/O
 | Double-buffered I/O | I/O thread prefetches the next tile pair while BLAS processes the current one |
 | Block sparsity | Tiles not allocated on disk are skipped with zero I/O cost |
 | Dtype support | `double` (FP64) and `double _Complex` (COMPLEX128) |
-| BLAS backend | Apple Accelerate (AMX/vecLib) · OpenBLAS · scalar fallback |
+| BLAS backend | Apple Accelerate (AMX/vecLib) · Intel MKL · OpenBLAS · scalar fallback |
 | NVMe alignment | 16 KiB-aligned pool pages match Apple Silicon NVMe page granularity |
 | 2D SUMMA tiling | Minimises SSD write amplification vs. naïve row-by-row streaming |
 
@@ -31,14 +31,22 @@ COMPLEX128 arithmetic: ~361 GFLOPS sustained while keeping NVMe I/O
 |---|---|
 | [HDF5](https://www.hdfgroup.org/solutions/hdf5/) ≥ 1.12 | Chunked on-disk tensor storage |
 | Apple Accelerate (macOS) | AMX-accelerated BLAS (`cblas_dgemm` / `cblas_zgemm`) |
-| OpenBLAS (Linux / optional macOS) | Portable BLAS alternative |
+| Intel MKL (Linux / Windows) | High-performance BLAS via Intel oneAPI |
+| OpenBLAS (Linux / macOS) | Portable BLAS alternative |
 | pthreads | Double-buffer I/O thread |
 | GCD / libdispatch (macOS) | GCD-parallel BLAS dispatch for multi-core AMX |
 
-Install HDF5 on macOS with [Homebrew](https://brew.sh/):
+Install HDF5:
 
 ```sh
+# macOS
 brew install hdf5
+
+# Ubuntu / Debian
+sudo apt install libhdf5-dev
+
+# OpenBLAS (if not using MKL or Accelerate)
+sudo apt install libopenblas-dev
 ```
 
 ---
@@ -46,7 +54,9 @@ brew install hdf5
 ## Build
 
 ```sh
-# Configure (auto-detects Accelerate on macOS, OpenBLAS on Linux)
+# Configure — auto-detects the best BLAS on the current machine:
+#   macOS  → Apple Accelerate
+#   Linux  → Intel MKL (if MKLROOT is set) → OpenBLAS → scalar fallback
 cmake -S . -B build
 
 # Build everything
@@ -66,10 +76,124 @@ cmake --build build -j
 ./build/bench_run_all
 ```
 
+To override the BLAS backend explicitly:
+
+```sh
+cmake -S . -B build -DBLAS_BACKEND=MKL       # Intel MKL
+cmake -S . -B build -DBLAS_BACKEND=OpenBLAS  # OpenBLAS
+cmake -S . -B build -DBLAS_BACKEND=None      # scalar fallback (no BLAS dependency)
+```
+
 To skip the large 40 GiB benchmark case (CI / low-disk environments):
 
 ```sh
 cmake -S . -B build -DCMAKE_C_FLAGS="-DSKIP_LARGE=1"
+```
+
+---
+
+## Performance Tuning
+
+### BLAS backend
+
+The BLAS backend is the single largest performance lever.  Set it at configure
+time with `-DBLAS_BACKEND=<name>`.  Auto-detection picks the best available
+backend, but you can override it for reproducibility or benchmarking.
+
+| Backend | Typical use case |
+|---|---|
+| `Accelerate` | macOS — uses AMX coprocessor, highest throughput on Apple Silicon |
+| `MKL` | Linux (Intel CPUs) — AVX-512 / AVX2, multi-threaded via `iomp5` |
+| `OpenBLAS` | Portable Linux / macOS fallback |
+| `None` | Debugging or dependency-free builds; scalar fallback only |
+
+### Threading (MKL)
+
+When built with MKL the engine links against `mkl_intel_thread`, which uses
+Intel's OpenMP runtime (`libiomp5`).  Control thread count via:
+
+```sh
+# Number of threads MKL uses for BLAS calls (takes precedence over OMP_NUM_THREADS)
+export MKL_NUM_THREADS=4
+
+# Fallback — respected if MKL_NUM_THREADS is not set
+export OMP_NUM_THREADS=4
+```
+
+**`KMP_AFFINITY`** controls how OpenMP threads are bound to physical cores.
+Poor affinity causes threads to migrate between cores mid-computation, breaking
+cache locality and hurting L3 reuse — which matters especially for the large
+tile sizes this engine uses.
+
+```sh
+# Recommended for single-socket Intel machines (most laptops and workstations):
+# Pack threads onto consecutive cores, starting from core 0, at fine granularity.
+export KMP_AFFINITY=compact,1,0,granularity=fine
+
+# NUMA / multi-socket: scatter threads across sockets to maximise memory BW
+export KMP_AFFINITY=scatter,granularity=fine
+
+# Disable affinity (OS scheduler decides — lowest overhead to set up, worst sustained perf)
+export KMP_AFFINITY=none
+```
+
+`compact` is the right default for this workload: the contracted tiles being
+accumulated into C stay hot in L3, and packing threads on one socket avoids
+inter-socket latency.
+
+### Threading (OpenBLAS)
+
+```sh
+export OPENBLAS_NUM_THREADS=4   # or OMP_NUM_THREADS if OpenBLAS was built with OpenMP
+```
+
+### CPU frequency governor (Linux)
+
+The `schedutil` governor drops CPU frequency during I/O-wait phases, then
+ramps back up for compute — adding latency at the start of each BLAS call.
+For sustained compute-bound runs, switch to `performance`:
+
+```sh
+echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+```
+
+Reset afterwards with `schedutil` or `ondemand`.
+
+### Buffer pool size
+
+The pool cap is the main memory knob.  Larger pools reduce redundant I/O by
+keeping more tiles in RAM between macro-blocks.
+
+```sh
+# Via environment variable (takes effect at runtime, no rebuild needed)
+export TENSOR_POOL_MB=2048   # 2 GiB pool
+
+# Or at API level
+cfg.pool_mb = 2048;
+```
+
+Set `TENSOR_POOL_MB` to roughly 10–20 % of available RAM as a starting point.
+The engine prints the actual pool configuration at startup.
+
+### Storage
+
+The engine is I/O-bound unless compute tiles are large enough to saturate the
+BLAS pipeline.  Storage speed matters:
+
+| Storage | Sequential read | Impact |
+|---|---|---|
+| Spinning HDD | ~100 MB/s | I/O dominates; BLAS mostly idle |
+| SATA SSD | ~500 MB/s | Mixed regime; tile size determines bottleneck |
+| NVMe SSD | 3–7 GB/s | BLAS often becomes the bottleneck; full pipeline utilisation |
+| `tmpfs` ramdisk | ~20 GB/s | Compute-bound; shows peak GFLOPS |
+
+To benchmark compute performance in isolation, copy the `.h5` files to a
+`tmpfs` mount before running the engine:
+
+```sh
+sudo mount -t tmpfs -o size=8G tmpfs /mnt/ram
+cp A.h5 B.h5 /mnt/ram/
+cd /mnt/ram && /path/to/build/engine_app
 ```
 
 ---
