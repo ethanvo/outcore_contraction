@@ -1302,6 +1302,7 @@ typedef struct {
     size_t                   *scatter_idx;
     size_t                    pool_capacity_bytes;
     size_t                    pool_num_pages;
+    int                       accumulate;   /* 1 = C += A*B; 0 = C = A*B */
 } ContractionShared;
 
 /* Per-GCD-task metadata for exec_macroblock_gcd. */
@@ -1686,7 +1687,7 @@ static int exec_macroblock_gcd(const ContractionShared *sh,
 
         prof.theo_read_A    = size_A;
         prof.theo_read_B    = use_b_cache ? size_B : P_A * size_B;
-        prof.theo_read_C    = 0;
+        prof.theo_read_C    = sh->accumulate ? size_C : 0;
         prof.theo_write_C   = size_C;
         /* Per-(gA,gB) B budget: total_con contracted pairs × block_fB tiles.*/
         prof.theo_b_bytes_mb = use_b_cache ? 0 : total_con * block_fB * bpp;
@@ -1777,8 +1778,52 @@ static int exec_macroblock_gcd(const ContractionShared *sh,
             if (fb_hi > total_fB) fb_hi = total_fB;
             size_t n_fB_cur = fb_hi - fb_lo;
 
-            /* Step 2: Zero C accumulators for this (gA, gB) pair. */
-            memset(C_accum_base, 0, n_fA_cur * n_fB_cur * bpp);
+            /* Step 2: Initialise C accumulators for this (gA, gB) pair.
+             *
+             * Normal mode:     zero-fill (C = A*B from scratch).
+             * Accumulate mode: read existing C tiles; zero if absent.
+             *                  This implements C += A*B out-of-core.
+             */
+            if (!sh->accumulate) {
+                memset(C_accum_base, 0, n_fA_cur * n_fB_cur * bpp);
+            } else {
+                for (size_t fai_l = 0; fai_l < n_fA_cur && ret == 0; fai_l++) {
+                    size_t fai = fa_lo + fai_l;
+                    const hsize_t *fa_row_c = fa_all + fai * MAX_RANK;
+                    for (size_t fbi_l = 0; fbi_l < n_fB_cur; fbi_l++) {
+                        size_t fbi = fb_lo + fbi_l;
+                        const hsize_t *fb_row_c = fb_all + fbi * MAX_RANK;
+                        /* Compute C tile coords from free-A/free-B coords. */
+                        hsize_t c_tile[MAX_RANK];
+                        memset(c_tile, 0, sizeof(c_tile));
+                        for (int d = 0; d < rank_C; d++) {
+                            int bc = plan->perm_C[(size_t)d];
+                            c_tile[(size_t)d] = (bc < n_fA)
+                                ? fa_row_c[(size_t)bc]
+                                : fb_row_c[(size_t)(bc - n_fA)];
+                        }
+                        char *C_data = C_accum_base +
+                                       (fai_l * n_fB_cur + fbi_l) * bpp;
+                        /* Pre-zero handles missing tiles and boundary padding. */
+                        memset(C_data, 0, bpp);
+                        TileMetadata *mC = registry_get_tile(sh->reg_C, c_tile);
+                        if (mC && mC->status == TILE_STATUS_ON_DISK) {
+                            if (read_chunk_typed(dset_C, mC->phys_offset,
+                                                 C_data, esz, rank_C,
+                                                 sh->reg_C->chunk_dims,
+                                                 sh->h5type_mem) < 0) {
+                                fprintf(stderr,
+                                        "exec_macroblock_gcd: C read error "
+                                        "(accumulate mode)\n");
+                                ret = -1;
+                                goto mb_cleanup;
+                            }
+                            prof.bytes_read_C += bpp;
+                        }
+                    }
+                    if (ret != 0) goto mb_cleanup;
+                }
+            }
             prof.b_bytes_cur_mb = 0;
 
             /* Step 3: Contracted loop. */
@@ -2377,8 +2422,9 @@ mb_cleanup:
     {
         const double GiB = 1024.0 * 1024.0 * 1024.0;
 
-        /* Assert: C was never read back from disk. */
-        if (prof.bytes_read_C > 0) {
+        /* In normal mode, C must never be read back from disk.
+         * In accumulate mode, C reads are expected (loading initial values). */
+        if (!sh->accumulate && prof.bytes_read_C > 0) {
             fprintf(stderr,
                     "\n[IOProfiler] *** ASSERTION FAILED: "
                     "C read back from disk (%zu bytes = %zu tiles) ***\n"
@@ -2431,7 +2477,7 @@ mb_cleanup:
                  prof.bytes_read_A,   prof.theo_read_A,  prof.tiles_read_A);
         PROF_ROW("Reads  Tensor B",
                  prof.bytes_read_B,   prof.theo_read_B,  prof.tiles_read_B);
-        PROF_ROW("Reads  Tensor C (must=0)",
+        PROF_ROW(sh->accumulate ? "Reads  Tensor C (init)" : "Reads  Tensor C (must=0)",
                  prof.bytes_read_C,   prof.theo_read_C,  0);
         PROF_ROW("Writes Tensor C",
                  prof.bytes_written_C, prof.theo_write_C, prof.tiles_written_C);
@@ -2446,7 +2492,9 @@ mb_cleanup:
             printf("  Zero redundant B reads — SSD I/O is optimal.\n");
         }
 
-        if (prof.bytes_read_C == 0) {
+        if (sh->accumulate) {
+            printf("  Accumulate mode: C tiles loaded from disk as initial values.\n");
+        } else if (prof.bytes_read_C == 0) {
             printf("  C accumulators stayed in RAM — zero disk reads of C.\n");
         }
         printf("=================================================================\n");
@@ -2551,12 +2599,14 @@ mb_cleanup:
 /* run_contraction_einsum                                                    */
 /* ----------------------------------------------------------------------- */
 
-int run_contraction_einsum(const char *expr,
+static int run_einsum_impl(const char *expr,
                             const char *file_A, const char *name_A,
                             const char *file_B, const char *name_B,
-                            const char *file_C, const char *name_C)
+                            const char *file_C, const char *name_C,
+                            int accumulate)
 {
-    printf("\n=== N-D Einsum Contraction Engine ===\n");
+    printf("\n=== N-D Einsum Contraction Engine%s ===\n",
+           accumulate ? " (accumulate)" : "");
     printf("Expression: %s\n", expr);
 
     /* ------------------------------------------------------------------ */
@@ -2705,36 +2755,98 @@ int run_contraction_einsum(const char *expr,
     }
 
     /* ------------------------------------------------------------------ */
-    /* 7. Create output dataset C.                                         */
+    /* 7. Open or create output dataset C.                                 */
     /* ------------------------------------------------------------------ */
-    if (create_chunked_dataset_einsum(file_C, name_C, rank_C,
-                                      global_C, chunk_dims_C, dtype) < 0) {
-        fprintf(stderr,
-                "run_contraction_einsum: create_chunked_dataset_einsum "
-                "failed for '%s'\n", file_C);
-        engine_cleanup(NULL, reg_A, reg_B, NULL,
-                       dset_A, dset_B, -1, fa, fb, -1);
-        return -1;
-    }
+    hid_t fc = -1, dset_C = -1;
+    TensorRegistry *reg_C = NULL;
 
-    hid_t fc     = engine_fopen_cached(file_C, H5F_ACC_RDWR, HDF5_CHUNK_CACHE_BYTES);
-    hid_t dset_C = (fc >= 0) ? dset_open_no_cache(fc, name_C) : -1;
-    if (fc < 0 || dset_C < 0) {
-        fprintf(stderr,
-                "run_contraction_einsum: cannot open output '%s'\n", file_C);
-        engine_cleanup(NULL, reg_A, reg_B, NULL,
-                       dset_A, dset_B, dset_C, fa, fb, fc);
-        return -1;
-    }
-
-    TensorRegistry *reg_C = registry_create_from_dset(dset_C);
-    if (!reg_C) {
-        fprintf(stderr,
-                "run_contraction_einsum: registry_create_from_dset(C) "
-                "failed\n");
-        engine_cleanup(NULL, reg_A, reg_B, NULL,
-                       dset_A, dset_B, dset_C, fa, fb, fc);
-        return -1;
+    if (!accumulate) {
+        /* Normal mode: create a fresh C file. */
+        if (create_chunked_dataset_einsum(file_C, name_C, rank_C,
+                                          global_C, chunk_dims_C, dtype) < 0) {
+            fprintf(stderr,
+                    "run_contraction_einsum: create_chunked_dataset_einsum "
+                    "failed for '%s'\n", file_C);
+            engine_cleanup(NULL, reg_A, reg_B, NULL,
+                           dset_A, dset_B, -1, fa, fb, -1);
+            return -1;
+        }
+        fc     = engine_fopen_cached(file_C, H5F_ACC_RDWR, HDF5_CHUNK_CACHE_BYTES);
+        dset_C = (fc >= 0) ? dset_open_no_cache(fc, name_C) : -1;
+        if (fc < 0 || dset_C < 0) {
+            fprintf(stderr,
+                    "run_contraction_einsum: cannot open output '%s'\n", file_C);
+            engine_cleanup(NULL, reg_A, reg_B, NULL,
+                           dset_A, dset_B, dset_C, fa, fb, fc);
+            return -1;
+        }
+        reg_C = registry_create_from_dset(dset_C);
+        if (!reg_C) {
+            fprintf(stderr,
+                    "run_contraction_einsum: registry_create_from_dset(C) "
+                    "failed\n");
+            engine_cleanup(NULL, reg_A, reg_B, NULL,
+                           dset_A, dset_B, dset_C, fa, fb, fc);
+            return -1;
+        }
+    } else {
+        /* Accumulate mode: open an existing C file and validate it. */
+        fc     = engine_fopen_cached(file_C, H5F_ACC_RDWR, HDF5_CHUNK_CACHE_BYTES);
+        dset_C = (fc >= 0) ? dset_open_no_cache(fc, name_C) : -1;
+        if (fc < 0 || dset_C < 0) {
+            fprintf(stderr,
+                    "run_contraction_einsum_acc: cannot open existing C '%s'.\n"
+                    "  C must exist before calling run_contraction_einsum_acc.\n",
+                    file_C);
+            engine_cleanup(NULL, reg_A, reg_B, NULL,
+                           dset_A, dset_B, dset_C, fa, fb, fc);
+            return -1;
+        }
+        reg_C = registry_create_from_dset(dset_C);
+        if (!reg_C) {
+            fprintf(stderr,
+                    "run_contraction_einsum_acc: registry_create_from_dset(C) "
+                    "failed\n");
+            engine_cleanup(NULL, reg_A, reg_B, NULL,
+                           dset_A, dset_B, dset_C, fa, fb, fc);
+            return -1;
+        }
+        /* Validate shape compatibility. */
+        if (reg_C->rank != rank_C) {
+            fprintf(stderr,
+                    "run_contraction_einsum_acc: C rank mismatch — "
+                    "file has rank %d, contraction expects %d\n",
+                    reg_C->rank, rank_C);
+            engine_cleanup(NULL, reg_A, reg_B, reg_C,
+                           dset_A, dset_B, dset_C, fa, fb, fc);
+            return -1;
+        }
+        for (int d = 0; d < rank_C; d++) {
+            if (reg_C->global_dims[(size_t)d] != global_C[(size_t)d]) {
+                fprintf(stderr,
+                        "run_contraction_einsum_acc: C dim %d mismatch — "
+                        "file=%llu expected=%llu\n",
+                        d,
+                        (unsigned long long)reg_C->global_dims[(size_t)d],
+                        (unsigned long long)global_C[(size_t)d]);
+                engine_cleanup(NULL, reg_A, reg_B, reg_C,
+                               dset_A, dset_B, dset_C, fa, fb, fc);
+                return -1;
+            }
+        }
+        if (reg_C->dtype != dtype) {
+            fprintf(stderr,
+                    "run_contraction_einsum_acc: C dtype mismatch — "
+                    "file=%s, contraction expects %s\n",
+                    (reg_C->dtype == DTYPE_FP64) ? "FP64" : "COMPLEX128",
+                    (dtype          == DTYPE_FP64) ? "FP64" : "COMPLEX128");
+            engine_cleanup(NULL, reg_A, reg_B, reg_C,
+                           dset_A, dset_B, dset_C, fa, fb, fc);
+            return -1;
+        }
+        /* Scan existing tiles so exec_macroblock_gcd knows which are on disk. */
+        long tiles_C = registry_scan_file(dset_C, reg_C);
+        printf("  C: %ld existing tiles (accumulate mode)\n", tiles_C);
     }
 
     /* ------------------------------------------------------------------ */
@@ -2976,6 +3088,7 @@ int run_contraction_einsum(const char *expr,
     for (int d = 0; d < rank_B; d++)  sh.chunk_dims_B_sz[d] = (size_t)reg_B->chunk_dims[d];
     sh.pool_capacity_bytes = num_pages * bytes_per_page;
     sh.pool_num_pages      = num_pages;
+    sh.accumulate          = accumulate;
 
     /* ------------------------------------------------------------------ */
     /* 12-13. Execute: A-pinning macro-block loop + GCD parallel BLAS.   */
@@ -2991,4 +3104,26 @@ int run_contraction_einsum(const char *expr,
     engine_cleanup(NULL, reg_A, reg_B, reg_C,
                    dset_A, dset_B, dset_C, fa, fb, fc);
     return ret;
+}
+
+/* ----------------------------------------------------------------------- */
+/* Public API wrappers                                                       */
+/* ----------------------------------------------------------------------- */
+
+int run_contraction_einsum(const char *expr,
+                            const char *file_A, const char *name_A,
+                            const char *file_B, const char *name_B,
+                            const char *file_C, const char *name_C)
+{
+    return run_einsum_impl(expr, file_A, name_A, file_B, name_B,
+                           file_C, name_C, /*accumulate=*/0);
+}
+
+int run_contraction_einsum_acc(const char *expr,
+                               const char *file_A, const char *name_A,
+                               const char *file_B, const char *name_B,
+                               const char *file_C, const char *name_C)
+{
+    return run_einsum_impl(expr, file_A, name_A, file_B, name_B,
+                           file_C, name_C, /*accumulate=*/1);
 }

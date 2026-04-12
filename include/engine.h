@@ -80,4 +80,23 @@ int run_contraction_einsum(const char *expr,
                             const char *file_B, const char *name_B,
                             const char *file_C, const char *name_C);
 
+/*
+ * Accumulating N-D tensor contraction: C += A*B.
+ *
+ * Identical to run_contraction_einsum() except that file_C must already
+ * exist with a compatible shape, rank, and dtype.  Each output tile is
+ * loaded from disk before accumulation so the final C holds the sum of
+ * the previous value and the new contraction result.
+ *
+ * Useful for multi-term contractions:
+ *   run_contraction_einsum    ("ij,jk->ik", ..., "C.h5", ...);  // C  = A*B
+ *   run_contraction_einsum_acc("ij,jk->ik", ..., "C.h5", ...);  // C += D*E
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int run_contraction_einsum_acc(const char *expr,
+                               const char *file_A, const char *name_A,
+                               const char *file_B, const char *name_B,
+                               const char *file_C, const char *name_C);
+
 #endif /* ENGINE_H */

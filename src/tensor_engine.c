@@ -88,6 +88,32 @@ int tensor_engine_contract(tensor_engine_t *engine,
     return (rc == 0) ? TENSOR_ENGINE_OK : TENSOR_ENGINE_ERR;
 }
 
+int tensor_engine_accumulate(tensor_engine_t *engine,
+                             const char      *einsum_expr,
+                             const char      *file_A,
+                             const char      *file_B,
+                             const char      *file_C)
+{
+    if (!engine || !einsum_expr || !file_A || !file_B || !file_C)
+        return TENSOR_ENGINE_ERR;
+
+    char pool_buf[32];
+    if (engine->pool_mb > 0) {
+        snprintf(pool_buf, sizeof(pool_buf), "%zu", engine->pool_mb);
+        setenv("TENSOR_POOL_MB", pool_buf, /*overwrite=*/1);
+    }
+
+    int rc = run_contraction_einsum_acc(einsum_expr,
+                                        file_A, DEFAULT_DSET,
+                                        file_B, DEFAULT_DSET,
+                                        file_C, DEFAULT_DSET);
+
+    if (engine->pool_mb > 0)
+        unsetenv("TENSOR_POOL_MB");
+
+    return (rc == 0) ? TENSOR_ENGINE_OK : TENSOR_ENGINE_ERR;
+}
+
 /* -------------------------------------------------------------------------
  * Error descriptions
  * -----------------------------------------------------------------------*/
