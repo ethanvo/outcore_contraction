@@ -157,6 +157,35 @@ int tensor_engine_contract(tensor_engine_t *engine,
                            const char      *file_C);
 
 /**
+ * tensor_engine_accumulate — accumulating out-of-core N-D tensor contraction.
+ *
+ * Computes C += A*B using the einsum notation, accumulating into an
+ * existing @p file_C rather than overwriting it.  All parameters have the
+ * same meaning as tensor_engine_contract().
+ *
+ * @p file_C must already exist and contain a dataset named "tensor" with
+ * shape, rank, and dtype compatible with the contraction result.  Each
+ * output tile is read from disk before accumulation, so the final C holds
+ * the element-wise sum of its previous value and the new contraction result.
+ *
+ * Typical use — multi-term contraction:
+ * @code
+ *   // First term: create C.h5 from scratch.
+ *   tensor_engine_contract(eng, "ij,jk->ik", "A1.h5", "B1.h5", "C.h5");
+ *   // Subsequent terms: accumulate into the existing C.h5.
+ *   tensor_engine_accumulate(eng, "ij,jk->ik", "A2.h5", "B2.h5", "C.h5");
+ *   tensor_engine_accumulate(eng, "ij,jk->ik", "A3.h5", "B3.h5", "C.h5");
+ * @endcode
+ *
+ * @return  TENSOR_ENGINE_OK (0) on success, or a negative error code.
+ */
+int tensor_engine_accumulate(tensor_engine_t *engine,
+                             const char      *einsum_expr,
+                             const char      *file_A,
+                             const char      *file_B,
+                             const char      *file_C);
+
+/**
  * tensor_engine_strerror — human-readable description of an error code.
  *
  * The returned string is a string literal; do not free it.

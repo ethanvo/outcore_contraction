@@ -299,6 +299,14 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_100gb_contraction.c)
     endif()
 endif()
 
+# --- Accumulate correctness tests ---
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_accumulate.c)
+    add_executable(test_accumulate tests/test_accumulate.c)
+    target_link_libraries(test_accumulate PRIVATE tensor_core ${HDF5_C_LIBRARIES} m)
+    target_include_directories(test_accumulate PRIVATE ${HDF5_INCLUDE_DIRS})
+    message(STATUS "  test_accumulate: enabled")
+endif()
+
 # --- Consolidated benchmark suite ---
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/bench/run_all.c)
     add_executable(bench_run_all bench/run_all.c)
