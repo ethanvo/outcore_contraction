@@ -36,6 +36,15 @@ extern "C" {
 #endif
 
 /* -------------------------------------------------------------------------
+ * Data types
+ * -----------------------------------------------------------------------*/
+
+/** FP64: IEEE 754 double precision (8 bytes per element). */
+#define TENSOR_DTYPE_FP64        0
+/** COMPLEX128: C99 double _Complex (16 bytes per element). */
+#define TENSOR_DTYPE_COMPLEX128  1
+
+/* -------------------------------------------------------------------------
  * Error codes
  * All functions that can fail return one of these values.
  * TENSOR_ENGINE_OK is guaranteed to be 0; all error codes are negative.
@@ -192,6 +201,57 @@ int tensor_engine_accumulate(tensor_engine_t *engine,
  * Returns "unknown error" for unrecognised codes.
  */
 const char *tensor_engine_strerror(int err);
+
+/* -------------------------------------------------------------------------
+ * Tensor creation and initialisation
+ * -----------------------------------------------------------------------*/
+
+/**
+ * tensor_engine_create — create an empty tensor HDF5 file.
+ *
+ * Creates a new HDF5 file at @p file_path containing a single dataset
+ * named "tensor" with the specified @p rank, @p shape, and @p dtype.
+ * Chunk dimensions are chosen to hit the engine's tile_bytes target
+ * (default: 16 MiB — optimised for Apple Silicon AMX and NVMe page
+ * granularity).  Dimension sizes are rounded to the nearest isotropic
+ * side that fits in tile_bytes.
+ *
+ * The dataset uses H5D_ALLOC_TIME_INCR so no disk space is consumed
+ * until tiles are written (block-sparse by default).
+ *
+ * @param engine     Engine handle from tensor_engine_init().
+ * @param file_path  Path for the new HDF5 file (created or overwritten).
+ * @param rank       Number of dimensions (1 ≤ rank ≤ 8).
+ * @param shape      Array of @p rank dimension sizes (each ≥ 1).
+ * @param dtype      TENSOR_DTYPE_FP64 or TENSOR_DTYPE_COMPLEX128.
+ *
+ * @return TENSOR_ENGINE_OK on success, or a negative error code.
+ */
+int tensor_engine_create(tensor_engine_t *engine,
+                         const char      *file_path,
+                         int              rank,
+                         const size_t    *shape,
+                         int              dtype);
+
+/**
+ * tensor_engine_fill — write a scalar to every element of an existing tensor.
+ *
+ * Opens the "tensor" dataset in @p file_path and writes every tile with
+ * the given scalar.  After this call each element equals @p value and all
+ * tiles are allocated on disk (the tensor is dense, not block-sparse).
+ *
+ * @param engine     Engine handle.
+ * @param file_path  Path to an HDF5 file containing a "tensor" dataset.
+ * @param value      Pointer to the fill scalar:
+ *                     - TENSOR_DTYPE_FP64:       pointer to a @c double.
+ *                     - TENSOR_DTYPE_COMPLEX128:  pointer to a @c double @c _Complex.
+ *                   The value is broadcast to every element.
+ *
+ * @return TENSOR_ENGINE_OK on success, or a negative error code.
+ */
+int tensor_engine_fill(tensor_engine_t *engine,
+                       const char      *file_path,
+                       const void      *value);
 
 #ifdef __cplusplus
 }
